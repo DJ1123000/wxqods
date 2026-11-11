@@ -216,8 +216,13 @@ static void TestDisplayNamePlausibility(NSString *path)
 
 static NSString *WriteTestBundle(NSString *displayName, NSString *localizedName)
 {
+    // A fresh path per bundle: wq_bundle_display_name caches by bundle path
+    // (on device a reinstall gets a new path), so reusing one path for
+    // different content would return the stale cached name.
+    static NSUInteger bundleCounter;
     NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                     [NSString stringWithFormat:@"WQBundleTest-%d.app", getpid()]];
+                     [NSString stringWithFormat:@"WQBundleTest-%d-%lu.app", getpid(),
+                      (unsigned long)bundleCounter++]];
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *plist = [NSString stringWithFormat:
