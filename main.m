@@ -994,7 +994,7 @@ static WQArchiveIO *wq_app_archive_io(void)
     if (paths.count == 0) return;
     NSString *message = [NSString stringWithFormat:
         @"这将永久删除 %lu 个完整备份及其中的全部内容。此操作无法撤销。",
-        (unsigned long)paths.count, paths.count == 1 ? @"" : @"s"];
+        (unsigned long)paths.count];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除备份？"
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
@@ -1307,7 +1307,7 @@ static WQArchiveIO *wq_app_archive_io(void)
         wq_log(@"compress: %lu item(s) -> %@: %@", (unsigned long)paths.count, dest, ok ? @"OK" : *error);
         if (ok && skipped)
             *note = [NSString stringWithFormat:@"已创建 %@。已排除 %lu 个符号链接或特殊文件。",
-                     zipName, (unsigned long)skipped, skipped == 1 ? @"" : @"s", skipped == 1 ? @"" : @"s"];
+                     zipName, (unsigned long)skipped];
         return ok;
     }];
 }
@@ -1356,7 +1356,7 @@ static WQArchiveIO *wq_app_archive_io(void)
                (unsigned long)files, (unsigned long)skipped);
         if (ok && skipped)
             *note = [NSString stringWithFormat:@"已将 %lu 个文件解压到 %@。ZIP 中的 %lu 个符号链接已被排除。",
-                     (unsigned long)files, files == 1 ? @"" : @"s", folder, (unsigned long)skipped, skipped == 1 ? @"" : @"s"];
+                     (unsigned long)files, folder, (unsigned long)skipped];
         return ok;
     }];
 }
