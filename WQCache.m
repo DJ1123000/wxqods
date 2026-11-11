@@ -81,11 +81,11 @@ static NSString *WQCacheConfirmationScope(NSArray<WQCacheItem *> *items)
     WQCacheSelectionCategories(items, &hasApps, &hasCrashLogs, &appCount);
     if (hasApps && hasCrashLogs) {
         return [NSString stringWithFormat:@"删除 %lu 个应用的 Library/Caches 和 tmp，以及崩溃日志",
-                (unsigned long)appCount, appCount == 1 ? @"" : @"s"];
+                (unsigned long)appCount];
     }
     if (hasApps) {
         return [NSString stringWithFormat:@"删除 %lu 个应用的 Library/Caches 和 tmp",
-                (unsigned long)appCount, appCount == 1 ? @"" : @"s"];
+                (unsigned long)appCount];
     }
     if (hasCrashLogs) return @"删除崩溃日志";
     return @"删除选定的缓存目标";
@@ -684,19 +684,19 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
         NSMutableArray<NSString *> *notes = [NSMutableArray new];
         if (failedEnumerations) {
             [notes addObject:[NSString stringWithFormat:@"%lu 个容器枚举失败",
-                              (unsigned long)failedEnumerations, failedEnumerations == 1 ? @"" : @"s"]];
+                              (unsigned long)failedEnumerations]];
         }
         if (limitedContainers) {
             [notes addObject:[NSString stringWithFormat:@"%lu 个容器的访问受限",
-                              (unsigned long)limitedContainers, limitedContainers == 1 ? @"" : @"s"]];
+                              (unsigned long)limitedContainers]];
         }
         if (limitedMeasurements) {
             [notes addObject:[NSString stringWithFormat:@"%lu 个缓存树测量受限",
-                              (unsigned long)limitedMeasurements, limitedMeasurements == 1 ? @"" : @"s"]];
+                              (unsigned long)limitedMeasurements]];
         }
         if (missingIdentities) {
             [notes addObject:[NSString stringWithFormat:@"%lu 个容器没有标识符或身份",
-                              (unsigned long)missingIdentities, missingIdentities == 1 ? @"" : @"s"]];
+                              (unsigned long)missingIdentities]];
         }
         NSString *note = nil;
         if (scanLimited) {
@@ -704,7 +704,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
             note = [NSString stringWithFormat:@"扫描不完整：%@。见日志。", [notes componentsJoinedByString:@"; "]];
         } else if (emptyRoots.count) {
             note = [NSString stringWithFormat:@"未找到 %@ 容器。",
-                    [emptyRoots componentsJoinedByString:@"或"], emptyRoots.count == 1 ? @"" : @"s"];
+                    [emptyRoots componentsJoinedByString:@"或"]];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self->_scanGeneration || cancellation.isCancelled) return;
@@ -764,7 +764,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
         cell.bar.progress = total ? (float)((double)selected / (double)total) : 0;
         cell.bar.hidden = _scanning && !_items.count;
         cell.statusLabel.text = _status ?: _result
-            ?: [NSString stringWithFormat:@"%@ 已选，共 %lu 项", wq_size_text(selected), (unsigned long)n, n == 1 ? @"" : @"s"];
+            ?: [NSString stringWithFormat:@"%@ 已选，共 %lu 项", wq_size_text(selected), (unsigned long)n];
         return cell;
     }
     WQCleanerCell *cell = [tableView dequeueReusableCellWithIdentifier:@"item"]
