@@ -197,7 +197,7 @@ int main(void)
 
         NSString *out6 = tmpdir(@"out6");
         CHECK(!wq_zip_extract([py stringByAppendingPathComponent:@"crc.zip"], out6, io, 1ull << 40, nil, nil, nil, nil, &err), @"bad CRC accepted");
-        CHECK([err containsString:@"checksum"], @"crc error text: %@", err);
+        CHECK([err containsString:@"校验和"], @"crc error text: %@", err);
 
         // Not a ZIP / truncated.
         NSString *junk = [work stringByAppendingPathComponent:@"junk.zip"];
