@@ -190,6 +190,28 @@ static void TestDisplayNamePlausibility(NSString *path)
     // A normal localized name still wins over the bundle name.
     WriteData(StoreWithName(@"Retry \u65e5\u672c"), path);
     WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Retry \u65e5\u672c"]);
+    // Wrong-language / descriptive garbage from the iOS 26.4 store falls back
+    // to the bundle name instead of being shown.
+    WriteData(StoreWithName(@"Kod sumber Fortran"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"preprocessed C source code"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"iOS-simulaattori"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"Macmini3,1"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"מגדל"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"Симуляторы"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    WriteData(StoreWithName(@"रेसिंग गेम"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    // A multi-word name that shares a word with the bundle name is real.
+    WriteData(StoreWithName(@"Example App Pro"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example App Pro"]);
+    // A two-word name is a plausible app name even without a shared word.
+    WriteData(StoreWithName(@"App Store"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"App Store"]);
 }
 
 static NSString *WriteTestBundle(NSString *displayName, NSString *localizedName)
