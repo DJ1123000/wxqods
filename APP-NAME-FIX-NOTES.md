@@ -589,3 +589,210 @@ Store and the existing regression-test expectations ("Café 日本
      are expected on 26.4.1 and are no longer a problem.
    If an app still shows wrong, send the `names:` lines plus that
    app's bundle ID.
+
+# Follow-up: CN5 did not work on-device (2026-11-11, iOS 26.4.1) — CN6
+
+## What the user saw (screenshots 18:06–18:08)
+
+User verdict: "有进步但不多，依然存在问题" (progress but not much,
+problems remain). Apple apps now mostly show correct English names
+(Freeform, Maps, Numbers, Wallet, Games, Shortcuts, Preview, Tips,
+Calculator, App Store, Keynote, Reminders, Stocks). Third-party apps
+STILL show garbage:
+
+- "text/x-uuencode" (com.ownbook.notes) — a MIME type, not a name
+- "VNC interneto vieta" (V2Box, hossin.asaadi.V2Box) — Lithuanian, 3 words
+- "Código de encabezado C" (maxpodApp) — Spanish, 4 words
+- "kommaadskilte værdier" (uzvideoapp2) — Danish, 2 words
+- "čtyřznakový kód" (com.apple.SOSBuddy) — Czech, 2 words
+- "Sporto žaidimai" (location-spoofer) — Lithuanian, 2 words
+- "vị trí web trên internet" (Hiddify) — Vietnamese, 5 words
+- "csv_145x145@2x.png" (arrivo.app) — a FILENAME, not a name
+- "EPUB 발행물" (nomad) — Korean
+- "PlugInKit-liitännäinen" (Google Keyboard) — Finnish
+- "ARKit-viitelisälaite" (globalrefresh) — Finnish
+
+And some show the raw bundle ID instead of a name: com.apple.smsFilter,
+com.ccb.ccbDemo, co.kitesim.app, com.zeptolab.cats, com.cmlink.esim.
+
+## User's directive (followed exactly)
+
+"直接底层代码首次验证即为中文，若没有，则摘取目录内例如taobao" —
+directly in the underlying code, the FIRST validation must be Chinese.
+If there is no Chinese name, then extract the name from the directory
+(e.g. taobao).
+
+His name priority (2026-11-11 17:41): "把错误排除，优先搞定中文，
+其次再显示英文" — eliminate wrong names first; correct CHINESE names
+first, correct ENGLISH bundle names second, NEVER show wrong-language
+garbage.
+
+## Why the CN5 plausibility check still leaked (traced in code)
+
+The garbage reaches the screen through `wq_display_name` →
+`wq_known_name` → `wq_ls_display_plausible`. The CN5 check failed in
+four distinct ways, all in `WQLaunchServices.m`:
+
+1. **Two-word phrases passed by design.** The multi-word rule only
+   fired at `wordCount >= 3`, and its comment said a two-word name
+   ("App Store", "Fresh name") "is a plausible app name and is left
+   alone". That is what let "kommaadskilte værdier", "Sporto žaidimai"
+   and "čtyřznakový kód" through.
+2. **MIME types and filenames passed.** There was no rejection for a
+   string containing "/" or ending in a file extension, and both
+   "text/x-uuencode" and "csv_145x145@2x.png" are single tokens, so
+   the multi-word rule never fired on them.
+3. **The ≥3-word rule could not fire reliably.** It cross-checks the
+   display name against the bundle name / bundle ID — but the bundle
+   name comes from the same possibly-misaligned layout. When the
+   winning layout is wrong, the name field is itself garbage and can
+   share a token with (or equal) the display name, so the "shares a
+   token" check passes vacuously. A string shares all its tokens with
+   itself. This is the most likely path by which "VNC interneto vieta",
+   "vị trí web trên internet" and "Código de encabezado C" reached the
+   screen despite the ≥3-word rule. The cross-check assumes the bundle
+   name is a trustworthy reference; under a wrong layout it is not.
+   (The user never sent a CN5 log, so the anchor score — `4/4` vs
+   `0/4` — is still unconfirmed; this mechanism is inferred from the
+   code, not proven from a device log.)
+4. **Korean/Japanese counted as "CJK".** `wq_name_has_cjk` counts
+   Hangul and kana, so "EPUB 발행물" (Korean) bypassed the multi-word
+   rule as a "real localized name", and `wq_name_script_ok` allows
+   Latin Extended ranges, so Lithuanian/Danish/Czech/Vietnamese letters
+   passed as "Latin". Single-token foreign words
+   ("PlugInKit-liitännäinen", "ARKit-viitelisälaite") never triggered
+   the multi-word rule at all.
+
+## New approach (this change, CN6)
+
+The restructure does not add more rules on top of the CN5 check — it
+removes the store display name from the trusted set. The store display
+name is now used ONLY when it is Chinese. Everything else comes from
+the app's own bundle or its path.
+
+New resolution order in `wq_display_name` (all in
+`WQLaunchServices.m`):
+
+1. **Chinese first, from any source** — the LSAPI localized name, the
+   bundle Info.plist name, the built-in Apple name table, or the store
+   display name. `wq_name_is_chinese` is stricter than
+   `wq_name_has_cjk`: it requires a Han character AND no Hiragana /
+   Katakana / Hangul, so Korean ("EPUB 발행물") and Japanese do not
+   pass as Chinese. A Chinese store display must also pass
+   `wq_ls_display_plausible` (the sanity gate).
+2. **The app's own English name** — the LSAPI localized name, the
+   bundle Info.plist name, or the built-in table. These are the app's
+   own declared names, not the store display field. (On 26.4.1 LSAPI is
+   dead and third-party Info.plists are unreadable, so this step is
+   usually empty for third-party apps — which is exactly when step 3
+   fires.)
+3. **The bundle-path folder name** — `wq_bundle_path_name` takes the
+   bundle path from the store record (`snapshot.bundlePaths`, known to
+   resolve on 26.4.1, e.g.
+   `/private/var/containers/Bundle/Application/<UUID>/Taobao.app`),
+   takes its last path component, strips ".app". That gives a clean
+   English name (WeChat, Taobao, Instagram). This needs no directory
+   listing and no Info.plist read — the path string itself is enough.
+4. **The store bundle name (CFBundleName)**, when `wq_bundle_name_ok`
+   says it is sane.
+5. **Nothing** — the caller falls back to the bundle ID (better than
+   garbage).
+
+New helpers:
+
+- `wq_name_is_chinese(name)` — Han present, no kana/Hangul.
+- `wq_display_name_sane(name)` — the hard gate, shared by every
+  candidate: rejects UTIs / App Store categories, reverse-DNS ids,
+  strings containing "/" (MIME types), strings ending in a known file
+  extension or containing "@2x"/"@3x" (filenames), simulator words,
+  device models, undecodable text (U+FFFD without CJK), and
+  non-Latin/CJK scripts.
+- `wq_bundle_path_name(bundlePath)` — the ".app" folder stem, or nil.
+
+`wq_ls_display_plausible` now calls `wq_display_name_sane` and the
+multi-word rule fires at **≥2 words** (not ≥3) when neither word is
+shared with the bundle name or bundle ID tokens. It is now only the
+second gate for a Chinese candidate, not the main defense.
+`wq_known_name` was removed; its logic lives in `wq_display_name` so
+that a Chinese name from any source is checked before any English
+name. The stale comment in `wq_bundle_path_for_id` (claiming the
+store record yields no bundle path on 26.4.1) was corrected — the
+bundle path DOES resolve there and is now a primary name source.
+
+## What the new resolution does per observed app
+
+Assuming the store record's bundlePath resolves (it does on 26.4.1
+per the CN4 log) and the Info.plist is unreadable (third-party apps):
+
+| App | CN5 showed | CN6 shows |
+| --- | --- | --- |
+| WeChat (com.tencent.xin) | "Kod sumber Fortran" | 微信 (if the store display is Chinese) or "WeChat" (folder name) |
+| V2Box (hossin.asaadi.V2Box) | "VNC interneto vieta" | "V2Box" |
+| Hiddify | "vị trí web trên internet" | "Hiddify" |
+| location-spoofer | "Sporto žaidimai" | "LocationSpoofer" (folder name; the real .app folder name is whatever the bundle is called — if it is "LocationSpoofer.app" this is exact) |
+| Taobao (com.taobao.taobao4iphone) | (garbage) | "Taobao" |
+| ownbook notes | "text/x-uuencode" | "Notes" |
+| arrivo | "csv_145x145@2x.png" | "Arrivo" |
+| nomad | "EPUB 발행물" | "Nomad" |
+| Google Keyboard | "PlugInKit-liitännäinen" | "Gboard" |
+| globalrefresh | "ARKit-viitelisälaite" | "GlobalRefresh" |
+| com.apple.smsFilter etc. | raw bundle ID | raw bundle ID (unchanged — no path/name available; still better than garbage) |
+
+## Tests
+
+- `tests/WQLaunchServicesTests.m`: new `TestCN6GarbageFallback` with
+  all 11 observed CN5 garbage strings plus the Taobao case — each must
+  resolve to the bundle-path folder name, never the garbage; a Chinese
+  display still wins over the folder name; two-word foreign phrases
+  are rejected even without a bundle path (nil → caller shows bundle
+  ID). `StoreWith26_4Record` now takes a bundlePath parameter.
+- Three existing expectations changed to the CN6 behavior (the store
+  display is never used unless Chinese, so even a plausible English
+  display falls back): "Fresh name" → "Example", "Example App Pro" →
+  "Example", "App Store" → "Example" (all in the no-bundle-path
+  fixture, where the bundle name is the fallback).
+- Python mirror validation (`/tmp/cn6_validate.py`, 32 cases, 0
+  failures): all 11 garbage strings → folder name, Chinese wins,
+  Info.plist English still beats the folder name when readable,
+  no-path garbage → bundle name or nil.
+- Bracket balance + format-string placeholder checks pass on both
+  files touched. No ObjC compile was possible on this Linux VM (no
+  clang/xcrun; the build runs on GitHub Actions macOS with
+  `-Wall -Wextra -Werror`) — the CI build is the compile check.
+
+## What I could NOT verify (no Mac / no device here)
+
+- That the ObjC compiles (see above — CI build is the check).
+- That the 26.4 layout's display-name offset is right (anchor 4/4 vs
+  0/4 still unconfirmed — the user never sent a CN5 log). CN6 no
+  longer depends on it for third-party apps: the display name is only
+  used when Chinese, and the folder name does not depend on the
+  name/display offsets at all (only on bundlePath at +0x00, which is
+  confirmed to resolve). If the layout IS wrong, the only visible
+  effect is that Chinese store display names may be missed and apps
+  show their English folder name instead — still correct, never
+  garbage.
+- The real .app folder name for location-spoofer (assumed
+  "LocationSpoofer.app" in the test; the on-device name is whatever
+  the bundle folder is called — it will be shown as-is).
+
+## What to check on-device after installing (CN6)
+
+1. Apps list and Cache Cleanup list: WeChat should show 微信 or
+   "WeChat" — never "Kod sumber Fortran". V2Box should show "V2Box",
+   Hiddify "Hiddify", Taobao "Taobao", location-spoofer its folder
+   name. No MIME types, no filenames, no wrong-language phrases
+   anywhere in the list.
+2. Open the in-app Log and look for lines starting with `names:`:
+   - `names: layout 26.4 anchor 4/4, N plausible names` — the 0xe8
+     offsets are confirmed correct. If it says `anchor 0/4`, the
+     offset hypothesis is wrong, but CN6 still shows folder names, so
+     this is now informational only.
+   - `names: bundle: <bid> -> <name>` (first 8) — Apple apps via
+     bundle read; after clearing the log, these lines reappear.
+   - `names: LSAPI: 0 apps` and `names: bundle dir unavailable`
+     are expected on 26.4.1 and are no longer a problem.
+   If an app still shows wrong, send the `names:` lines plus that
+   app's bundle ID and its .app folder name (visible in the log's
+   `names: bundle:` lines only for readable bundles; otherwise from
+   the Apps list's container path).
