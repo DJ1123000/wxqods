@@ -412,6 +412,35 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
 
 @end
 
+// Background task shared by the cache scan and clean (same pattern as the
+// full scan in main.m). iOS grants about 30 s when the user switches apps;
+// on expiration the work is cancelled cleanly so its partial results are
+// published instead of lost. One task id is shared: scan and clean never run
+// at the same time, and the expiration handler cancels whichever is current.
+static UIBackgroundTaskIdentifier gCacheBackgroundTask = UIBackgroundTaskInvalid;
+
+static void WQCacheBeginBackgroundTask(NSString *name, void (^onExpire)(void))
+{
+    if (gCacheBackgroundTask != UIBackgroundTaskInvalid) return;
+    gCacheBackgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:name expirationHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (onExpire) onExpire();
+            if (gCacheBackgroundTask != UIBackgroundTaskInvalid) {
+                [UIApplication.sharedApplication endBackgroundTask:gCacheBackgroundTask];
+                gCacheBackgroundTask = UIBackgroundTaskInvalid;
+            }
+        });
+    }];
+}
+
+static void WQCacheEndBackgroundTask(void)
+{
+    if (gCacheBackgroundTask == UIBackgroundTaskInvalid) return;
+    UIBackgroundTaskIdentifier task = gCacheBackgroundTask;
+    gCacheBackgroundTask = UIBackgroundTaskInvalid;
+    [UIApplication.sharedApplication endBackgroundTask:task];
+}
+
 @implementation WQCacheCleanerViewController {
     NSArray<WQCacheItem *> *_items;
     NSArray<WQCacheItem *> *_visibleItems;
@@ -554,10 +583,21 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
     _result = nil;
     [self updateButtons];
     [self setStatus:@"正在查找应用…"];
+    // Keep the scan alive if the user switches apps. iOS grants about 30 s;
+    // on expiration the scan is cancelled cleanly so the partial results are
+    // published instead of lost (see below).
+    __weak typeof(self) weakSelf = self;
+    WQCacheBeginBackgroundTask(@"WQ cache scan", ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_scanCancellation cancel];
+        [strongSelf->_cleanCancellation cancel];
+    });
     dispatch_async(wq_io_scan(), ^{
         NSMutableArray<WQCacheItem *> *items = [NSMutableArray new];
         NSMutableArray<NSString *> *emptyRoots = [NSMutableArray new];
         BOOL scanLimited = NO;
+        BOOL interrupted = NO;
         NSUInteger failedEnumerations = 0;
         NSUInteger limitedContainers = 0;
         NSUInteger limitedMeasurements = 0;
@@ -565,16 +605,26 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
         NSArray *roots = @[@"/private/var/mobile/Containers/Data/Application",
                            @"/private/var/mobile/Containers/Data/PluginKitPlugin"];
         for (NSString *root in roots) {
-            if (cancellation.isCancelled) return;
+            if (cancellation.isCancelled) { interrupted = YES; break; }
             NSString *kind = [root.lastPathComponent isEqualToString:@"Application"] ? @"应用" : @"扩展";
-            NSArray *containers = wq_enumerate(root, 0, cancellation, ^(int64_t done, int64_t total, NSUInteger __unused f) {
+            void (^progress)(int64_t, int64_t, NSUInteger) = ^(int64_t done, int64_t total, NSUInteger __unused f) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (generation != self->_scanGeneration || cancellation.isCancelled) return;
                     [self setStatus:[NSString stringWithFormat:@"正在查找 %@… %lld%%", kind, (long long)(done * 100 / total)]];
                 });
-            });
+            };
+            NSArray *containers = wq_enumerate(root, 0, cancellation, progress);
+            if (!containers && !cancellation.isCancelled) {
+                // One enumeration can fail transiently after the app was
+                // suspended and resumed (a dropped container-manager /
+                // LaunchServices IPC, or a stale sandbox grant). Re-establish
+                // access and try once more before giving up on the root.
+                wq_log(@"cache scan: %@ container enumeration failed; retrying once", kind);
+                (void)wq_grant(root);
+                containers = wq_enumerate(root, 0, cancellation, progress);
+            }
             if (!containers) {
-                if (cancellation.isCancelled) return;
+                if (cancellation.isCancelled) { interrupted = YES; break; }
                 scanLimited = YES;
                 failedEnumerations++;
                 wq_log(@"cache scan: %@ container enumeration failed", kind);
@@ -590,7 +640,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
             if (!containers.count) [emptyRoots addObject:kind];
             NSUInteger idx = 0;
             for (NSString *c in containers) {
-                if (cancellation.isCancelled) return;
+                if (cancellation.isCancelled) { interrupted = YES; break; }
                 idx++;
                 if (idx % 10 == 0 || idx == containers.count) {
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -612,7 +662,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
                 WQCacheMeasurementState tempState = WQCacheMeasurementLimited;
                 if (!WQCacheMeasureContainer(c, granted, safeContainer, safeCaches, safeTmp,
                                              cancellation, &cacheBytes, &tempBytes,
-                                             &cacheState, &tempState)) return;
+                                             &cacheState, &tempState)) { interrupted = YES; break; }
                 if (!granted || !safeContainer) {
                     scanLimited = YES;
                     limitedContainers++;
@@ -651,8 +701,9 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
                 item.selected = !item.limited;
                 [items addObject:item];
             }
+            if (interrupted) break;
         }
-        if (cancellation.isCancelled) return;
+        if (!interrupted) {
         unsigned long long crash = 0;
         // Crash logs are in a system group, which worse_query reaches on iOS 27
         // only. On iOS 26 the section is left out instead of reported as limited.
@@ -661,7 +712,9 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
         WQCacheMeasurementState crashState = !crashReachable ? WQCacheMeasurementMissing
             : safeCrashPath ? WQCacheMeasureDirectory(kCrashLogsPath, cancellation, &crash)
                             : WQCacheMeasurementLimited;
-        if (crashState == WQCacheMeasurementCancelled) return;
+        if (crashState == WQCacheMeasurementCancelled) {
+            interrupted = YES;
+        } else {
         if (crashState == WQCacheMeasurementLimited) {
             scanLimited = YES;
             limitedMeasurements++;
@@ -678,10 +731,16 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
             logs.selected = !logs.limited;
             [items addObject:logs];
         }
+        }
+        }
         [items sortUsingComparator:^NSComparisonResult(WQCacheItem *a, WQCacheItem *b) {
             return a.bytes > b.bytes ? NSOrderedAscending : (a.bytes < b.bytes ? NSOrderedDescending : NSOrderedSame);
         }];
         NSMutableArray<NSString *> *notes = [NSMutableArray new];
+        if (interrupted) {
+            scanLimited = YES;
+            [notes addObject:@"扫描被中断"];
+        }
         if (failedEnumerations) {
             [notes addObject:[NSString stringWithFormat:@"%lu 个容器枚举失败",
                               (unsigned long)failedEnumerations]];
@@ -707,8 +766,18 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
                     [emptyRoots componentsJoinedByString:@"或"]];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation != self->_scanGeneration || cancellation.isCancelled) return;
-            self->_items = items;
+            // A newer scan owns the screen now; only it may publish.
+            if (generation != self->_scanGeneration) return;
+            // An interrupted scan publishes what it found so far instead of
+            // discarding it. And a failed rescan must not wipe a good list:
+            // if this scan found nothing because a root enumeration failed
+            // but a previous list exists, keep the previous list so the user
+            // can still clean instead of landing on 0 KB with greyed-out
+            // buttons.
+            BOOL keepPrevious = items.count == 0 && failedEnumerations > 0 && self->_items.count > 0;
+            if (!keepPrevious) {
+                self->_items = items;
+            }
             [self rebuildVisibleItems];
             self->_scanning = NO;
             self->_scanLimited = scanLimited;
@@ -717,9 +786,11 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
             [self.refreshControl endRefreshing];
             [self.tableView reloadData];
             [self updateButtons];
+            WQCacheEndBackgroundTask();
         });
     });
 }
+
 
 #pragma mark Table
 
@@ -888,6 +959,15 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
     _cleaning = YES;
     [self updateButtons];
     [self setStatus:@"正在清理…"];
+    // Keep the clean alive if the user switches apps; on expiration it stops
+    // after the current item and reports what was freed (see below).
+    __weak typeof(self) weakSelf = self;
+    WQCacheBeginBackgroundTask(@"WQ cache clean", ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_cleanCancellation cancel];
+        [strongSelf->_scanCancellation cancel];
+    });
     dispatch_async(wq_io(), ^{
         unsigned long long freed = 0;
         BOOL allOk = YES;
@@ -912,6 +992,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
                 self->_result = [NSString stringWithFormat:@"清理已取消：%@。请重新扫描后再试。", validationFailure];
                 [self.tableView reloadData];
                 [self updateButtons];
+                WQCacheEndBackgroundTask();
             });
             return;
         }
@@ -969,6 +1050,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
                 self->_result = [NSString stringWithFormat:@"已释放 %@。%@", wq_size_text(freed),
                                  allOk ? @"" : @" 有些项目无法删除（见日志）。"];
             }
+            WQCacheEndBackgroundTask();
         });
     });
 }
