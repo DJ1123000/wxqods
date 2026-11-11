@@ -452,6 +452,7 @@ static void WQCacheEndBackgroundTask(void)
     WQScanCancellation *_cleanCancellation;
     NSUInteger _scanGeneration;
     NSTimeInterval _lastScanFinished;
+    NSUInteger _interruptedRestarts; // auto-restarts after an interrupted scan, capped (see publish)
 }
 
 - (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
@@ -476,6 +477,9 @@ static void WQCacheEndBackgroundTask(void)
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    // A user-driven (re)appearance starts a fresh auto-restart budget for
+    // interrupted scans (see the publish block).
+    _interruptedRestarts = 0;
     if (_scanning && _scanCancellation.isCancelled) {
         [self scan];
         return;
@@ -568,6 +572,7 @@ static void WQCacheEndBackgroundTask(void)
     wq_enumerate_invalidate();
     wq_container_size_invalidate_all();
     wq_display_names_reset_miss();
+    _interruptedRestarts = 0;
     [self scan];
 }
 
@@ -585,13 +590,13 @@ static void WQCacheEndBackgroundTask(void)
     [self setStatus:@"正在查找应用…"];
     // Keep the scan alive if the user switches apps. iOS grants about 30 s;
     // on expiration the scan is cancelled cleanly so the partial results are
-    // published instead of lost (see below).
-    __weak typeof(self) weakSelf = self;
+    // published instead of lost (see below). The handler cancels only this
+    // scan's token: it belongs to the task this scan registered, so a task
+    // that outlives a superseded scan must not kill the newer scan that
+    // adopted it (a stale handler cancelling the current token was the
+    // suspected cause of scans stopping after a few items).
     WQCacheBeginBackgroundTask(@"WQ cache scan", ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        [strongSelf->_scanCancellation cancel];
-        [strongSelf->_cleanCancellation cancel];
+        [cancellation cancel];
     });
     dispatch_async(wq_io_scan(), ^{
         NSMutableArray<WQCacheItem *> *items = [NSMutableArray new];
@@ -787,6 +792,34 @@ static void WQCacheEndBackgroundTask(void)
             [self.tableView reloadData];
             [self updateButtons];
             WQCacheEndBackgroundTask();
+            unsigned long long foundBytes = 0;
+            for (WQCacheItem *it in items) foundBytes += it.bytes;
+            wq_log(@"cache scan: found %lu items (%@), interrupted=%d, failed enumerations=%lu, kept previous=%d",
+                   (unsigned long)items.count, wq_size_text(foundBytes), (int)interrupted,
+                   (unsigned long)failedEnumerations, (int)keepPrevious);
+            // An interrupted scan leaves a partial list. If the user is still
+            // looking at this screen (foreground, view visible) and no clean
+            // is running, restart the scan so the list completes instead of
+            // sticking at a partial count (e.g. 6 items after the background
+            // task expired mid-scan). Bounded: a scan that keeps being
+            // interrupted stops retrying after a few attempts; the user can
+            // still pull to refresh. The budget resets on a complete scan
+            // and on a user-initiated rescan (see viewWillAppear/userRefresh).
+            if (interrupted && !_cleaning && self.view.window &&
+                [UIApplication.sharedApplication applicationState] == UIApplicationStateActive) {
+                if (self->_interruptedRestarts < 3) {
+                    self->_interruptedRestarts++;
+                    __weak typeof(self) weakSelf = self;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        __strong typeof(weakSelf) strongSelf = weakSelf;
+                        if (!strongSelf || strongSelf->_cleaning || !strongSelf.view.window) return;
+                        [strongSelf scan];
+                    });
+                }
+            } else if (!interrupted) {
+                self->_interruptedRestarts = 0;
+            }
         });
     });
 }
@@ -960,13 +993,11 @@ static void WQCacheEndBackgroundTask(void)
     [self updateButtons];
     [self setStatus:@"正在清理…"];
     // Keep the clean alive if the user switches apps; on expiration it stops
-    // after the current item and reports what was freed (see below).
-    __weak typeof(self) weakSelf = self;
+    // after the current item and reports what was freed (see below). The
+    // handler cancels only this clean's token, for the same reason as the
+    // scan's handler above: a stale task must not kill newer work.
     WQCacheBeginBackgroundTask(@"WQ cache clean", ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        [strongSelf->_cleanCancellation cancel];
-        [strongSelf->_scanCancellation cancel];
+        [cancellation cancel];
     });
     dispatch_async(wq_io(), ^{
         unsigned long long freed = 0;
