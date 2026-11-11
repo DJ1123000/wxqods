@@ -417,7 +417,7 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
 // on expiration the work is cancelled cleanly so its partial results are
 // published instead of lost. One task id is shared: scan and clean never run
 // at the same time, and the expiration handler cancels whichever is current.
-static UIBackgroundTaskIdentifier gCacheBackgroundTask = UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier gCacheBackgroundTask;   // 0 is UIBackgroundTaskInvalid
 
 static void WQCacheBeginBackgroundTask(NSString *name, void (^onExpire)(void))
 {
