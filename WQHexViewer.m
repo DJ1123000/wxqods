@@ -348,7 +348,7 @@ static void wqh_alert(UIViewController *host, NSString *title, NSString *message
     NSDictionary *runs = [self runs];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存更改？"
         message:[NSString stringWithFormat:@"%@ 中的 %lu 个字节将被原地覆盖。当前文件会先备份。",
-                 (unsigned long)_edits.count, _path]
+                 _path, (unsigned long)_edits.count]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *__unused x) {
