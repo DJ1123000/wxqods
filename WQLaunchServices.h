@@ -30,5 +30,8 @@ NSArray<NSString *> *_Nullable wq_ls_container_paths(NSString *_Nullable storeHi
 // The .app bundle of an installed app, from the same database (for icons
 // where iOS won't hand them out). Nil if unknown.
 NSString *_Nullable wq_bundle_path_for_id(NSString *bundleID);
+// Reset the first-8 "names:" note counters so that after the log is
+// cleared, a fresh run logs them again. Called from wq_log_clear.
+void wq_bundle_display_note_reset(void);
 
 NS_ASSUME_NONNULL_END

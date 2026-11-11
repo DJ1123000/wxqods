@@ -13,22 +13,36 @@
 
 #pragma mark - App names from the LaunchServices database
 
-// LaunchServices' own API refuses this app on 27.x (OSStatus -54), but lsd
-// keeps its database (CSStore2, magic "bdsl") in an Internal Daemon
-// container that we can read. In it, Bundle records are 0x250 bytes long,
-// preceded by [u32][u32 0x250]: +0x0c bundle id, +0x6c bundle name, +0x74
-// display name, each a string reference (string id << 2). Strings are
-// stored as [u32 id][u32 length][UTF-8][NUL].
-// The bundle path is read at +0x00 in every layout in kWQLSLayouts. That
-// offset is the iOS 27 record layout (and the regression tests cover it);
-// on iOS 26.4 the field at +0x00 is not a bundle-path reference, so
-// snapshot.bundlePaths comes out empty and the Info.plist route below never
-// starts (verified on device: zero "names: bundle:" log lines for 313 apps).
+// LaunchServices' own API refuses this app on 27.x (OSStatus -54) and
+// returns nothing on 26.4.1 either (0 apps on device), but lsd keeps its
+// database (CSStore2, magic "bdsl") in an Internal Daemon container that
+// we can read. In it, Bundle records are preceded by [u32][u32 size]:
+// +0x0c bundle id, then container, bundle name and display name, each a
+// string reference (string id << 2). Strings are stored as
+// [u32 id][u32 length][UTF-8][NUL].
+// The bundle path is read at +0x00 in every layout in kWQLSLayouts, and
+// that field DOES resolve on 26.4.1 (a third-party path such as
+// /private/var/containers/Bundle/Application/<UUID>/Instagram.app is
+// known from the record). The earlier claim that snapshot.bundlePaths
+// comes out empty there was wrong: it rested on zero "names: bundle:"
+// log lines, which was a logging artifact (the 8-note counter had been
+// exhausted before the log was cleared once — see
+// wq_bundle_display_note_reset). What is actually blocked on 26.4.1 is
+// READING a third-party bundle's Info.plist ("Operation not permitted");
+// Apple apps' bundles in /Applications/ are world-readable and resolve.
 // The bundle path therefore also comes from the LaunchServices API's
 // bundleURL and from listing /private/var/containers/Bundle/Application,
-// neither of which depends on the record layout (see wq_lsapi_name_map and
-// wq_bundle_dir_map). Whether the app bundles can be opened at all is
-// decided by those two loaders at runtime, not assumed here.
+// but both are dead on 26.4.1 too (LSAPI: 0 apps; the Bundle directory
+// is not listable), so the store record is the only bundle-path source.
+// The record layout itself differs by release: on 26.4.1 the bundle
+// record is 0xe8 bytes with the container at +0x60 (from the layout
+// hint), not the 0x23c-byte "26" layout, whose name/display-name offsets
+// are misaligned and yield wrong-language strings. The "26.4" layout
+// below follows the pattern all known layouts share (name = container+4,
+// displayName = name+8, bundle id at +0x0c, bundle path at +0x00) and is
+// validated at parse time by anchor bundle names (see
+// wq_ls_anchor_score): a layout is only preferred when its name field
+// reads the known CFBundleName of several Apple apps.
 // Names that exist only in localized form (most Apple apps) are not decoded;
 // the built-in table below covers those.
 
@@ -181,6 +195,16 @@ typedef struct {
 static const WQLSLayout kWQLSLayouts[] = {
     { "27.0", 0x250, 0x0c, 0x68, 0x6c, 0x74, 0x00, 0x118, 0x00, 0x54 },
     { "26",   0x23c, 0x0c, 0x64, 0x68, 0x70, 0x00, 0x104, 0x00, 0x50 },
+    // iOS 26.4.1 (from a device's layout hint): the bundle record is
+    // 0xe8 bytes with the container at +0x60 — not the 0x23c-byte "26"
+    // layout above. The field positions follow the pattern every known
+    // layout shares (name = container+4, displayName = name+8, bundle id
+    // at +0x0c, bundle path at +0x00); the plug-in container at +0x4c is
+    // likewise from the hint (0x104@0x4c). Whether this layout is the
+    // right one is not assumed: wq_ls_anchor_score validates its name
+    // field against known Apple bundle names at parse time, and the
+    // layout is only preferred when that check passes.
+    { "26.4", 0x0e8, 0x0c, 0x60, 0x64, 0x6c, 0x00, 0x104, 0x00, 0x4c },
     // iOS 27.2 (from a device's layout hint): container fields 4 bytes later
     // than on 27.0. Whether the bundle id moved too isn't known yet, so both
     // positions are tried; the one that maps the most containers wins.
@@ -351,8 +375,8 @@ static void wq_ls_log_summary(const uint8_t *b, size_t n, NSString *layout, NSUI
 // size words can be found with memmem first and only those offsets
 // validated. The per-size streams below are merged in file order, so the
 // records are collected exactly as the old scan collected them.
-static const uint32_t kWQLSRecordSizes[] = { 0x250, 0x23c, 0x25c, 0x118, 0x104, 0x120 };
-enum { kWQLSRecordSizeCount = 6 };
+static const uint32_t kWQLSRecordSizes[] = { 0x250, 0x23c, 0x25c, 0x0e8, 0x118, 0x104, 0x120 };
+enum { kWQLSRecordSizeCount = 7 };
 _Static_assert(sizeof(kWQLSRecordSizes) / sizeof(kWQLSRecordSizes[0]) == kWQLSRecordSizeCount,
                "record size table mismatch");
 
@@ -377,6 +401,47 @@ static BOOL wq_ls_next_record(const uint8_t *b, size_t n, uint32_t size,
         return YES;
     }
     return NO;
+}
+
+// Forward: defined with the name-resolution helpers below; the parser
+// uses it only to rank layouts by how many of their display names are
+// usable, so a layout that maps containers but reads garbage names does
+// not beat one that reads real names.
+static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSString *bundleID);
+
+// Whether a layout's name field reads the right strings, checked against
+// the known CFBundleName of several Apple apps. The bundle name is not
+// localized, so it is the same on every device. A layout whose name
+// offset is wrong reads garbage (or nothing) here and scores 0; a layout
+// with the right offsets scores 4. This is what stops a wrong layout
+// from winning on container count alone while its display names are
+// wrong-language strings.
+static NSUInteger wq_ls_anchor_score(NSDictionary *bundleName)
+{
+    static NSDictionary<NSString *, NSString *> *expected;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        expected = @{
+            @"com.apple.mobilesafari": @"MobileSafari",
+            @"com.apple.Preferences": @"Preferences",
+            @"com.apple.camera": @"Camera",
+            @"com.apple.mobilenotes": @"MobileNotes",
+        };
+    });
+    NSUInteger score = 0;
+    for (NSString *bid in expected) {
+        if ([bundleName[bid] isEqualToString:expected[bid]]) score++;
+    }
+    return score;
+}
+
+static NSUInteger wq_ls_plausible_count(NSDictionary *display, NSDictionary *bundleName)
+{
+    NSUInteger count = 0;
+    for (NSString *bid in display) {
+        if (wq_ls_display_plausible(display[bid], bundleName[bid], bid)) count++;
+    }
+    return count;
 }
 
 static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
@@ -529,6 +594,7 @@ static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
     };
     NSDictionary *display = nil, *bundleName = nil, *containers = nil, *bundlePaths = nil;
     size_t chosen = 0;
+    NSUInteger bestAnchorScore = 0, bestPlausible = 0;
     for (size_t l = 0; l < kWQLSLayoutCount; l++) {
         NSMutableDictionary *layoutDisplay = [NSMutableDictionary new], *layoutBundleName = [NSMutableDictionary new];
         NSMutableDictionary *layoutBundlePaths = [NSMutableDictionary new];
@@ -571,13 +637,26 @@ static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
         }
         for (NSString *path in layoutContainers.allKeys)
             if (layoutContainers[path] == NSNull.null) [layoutContainers removeObjectForKey:path];
-        if (!containers || layoutContainers.count > containers.count ||
-            (layoutContainers.count == containers.count && layoutDisplay.count > display.count)) {
+        // Rank layouts first by whether their name field is right (anchor
+        // bundle names), then by containers mapped, then by usable display
+        // names. The old ranking (containers only) let a layout with
+        // misaligned name offsets win while its display names were
+        // wrong-language strings.
+        NSUInteger anchorScore = wq_ls_anchor_score(layoutBundleName);
+        NSUInteger plausible = wq_ls_plausible_count(layoutDisplay, layoutBundleName);
+        if (!containers || anchorScore > bestAnchorScore ||
+            (anchorScore == bestAnchorScore && layoutContainers.count > containers.count) ||
+            (anchorScore == bestAnchorScore && layoutContainers.count == containers.count &&
+             plausible > bestPlausible) ||
+            (anchorScore == bestAnchorScore && layoutContainers.count == containers.count &&
+             plausible == bestPlausible && layoutDisplay.count > display.count)) {
             display = layoutDisplay;
             bundleName = layoutBundleName;
             bundlePaths = layoutBundlePaths;
             containers = layoutContainers;
             chosen = l;
+            bestAnchorScore = anchorScore;
+            bestPlausible = plausible;
         }
     }
     // A few Apple apps' names, to check the name fields of a new layout.
@@ -597,6 +676,9 @@ static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
         if (newSummary) lastSummary = summary;
     }
     if (newSummary && samples.count) wq_log(@"names: sample: %@", [samples componentsJoinedByString:@", "]);
+    if (newSummary) wq_log(@"names: layout %@ anchor %lu/4, %lu plausible names",
+                           @(kWQLSLayouts[chosen].label), (unsigned long)bestAnchorScore,
+                           (unsigned long)bestPlausible);
     if (newSummary) wq_ls_log_summary(b, n, @(kWQLSLayouts[chosen].label), layoutRecs[chosen].length / (5 * sizeof(uint32_t)),
                       layoutPlugins[chosen].length / (2 * sizeof(uint32_t)), display.count, containers.count);
     if (bundlePathsOut) *bundlePathsOut = [bundlePaths copy];
@@ -1004,6 +1086,24 @@ static BOOL wq_name_is_device_model(NSString *name)
     return hasLetter && last >= '0' && last <= '9';
 }
 
+// The meaningful tokens of a bundle id (com.tencent.xin -> tencent,
+// xin). Generic parts that appear in almost every id do not count as a
+// shared word: they would let any description through.
+static NSSet<NSString *> *wq_bundle_id_tokens(NSString *bundleID)
+{
+    static NSSet<NSString *> *generic;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        generic = [NSSet setWithObjects:@"com", @"apple", @"app", @"ios", @"iphone", @"ipad",
+                   @"mac", @"macos", @"watch", @"tvos", nil];
+    });
+    NSMutableSet<NSString *> *tokens = [NSMutableSet new];
+    for (NSString *t in wq_name_tokens(bundleID)) {
+        if (t.length >= 2 && ![generic containsObject:t]) [tokens addObject:t];
+    }
+    return tokens;
+}
+
 // A LaunchServices display name that is not a name at all. The store's
 // string table holds many kinds of strings, and on iOS 26.4 the
 // display-name field of the winning layout points at one of those instead
@@ -1019,7 +1119,10 @@ static BOOL wq_name_is_device_model(NSString *name)
 // word is a description, not a name. The cross-check is on the
 // English/ASCII side only: a CJK name (display "微信" vs bundle name
 // "WeChat") is a legitimate localized name and always passes.
-static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName)
+// bundleID is the fallback cross-check when the bundle name is unknown:
+// a real display name usually shares a token with its id, while a
+// description shares none (see wq_bundle_id_tokens).
+static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSString *bundleID)
 {
     if (!name.length) return NO;
     if ([name hasPrefix:@"public."]) return NO;
@@ -1049,20 +1152,32 @@ static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName)
     }
     // A multi-word Latin phrase with no word in common with the bundle name
     // is a description ("preprocessed C source code"), not a name. Only
-    // names without CJK are compared, and only when a bundle name exists to
-    // compare against; a two-word name ("App Store", "Fresh name") is a
-    // plausible app name and is left alone.
-    if (bundleName.length && !wq_name_has_cjk(name)) {
+    // names without CJK are compared; a two-word name ("App Store",
+    // "Fresh name") is a plausible app name and is left alone. When the
+    // bundle name is unknown, the bundle id is the fallback cross-check
+    // (a real display name usually shares a token with its id, while a
+    // description shares none); a phrase that matches neither is rejected
+    // even without a bundle name to compare against, so a suspect display
+    // name never wins by default.
+    if (!wq_name_has_cjk(name)) {
         NSArray<NSString *> *words = [name componentsSeparatedByCharactersInSet:
                                       [NSCharacterSet whitespaceCharacterSet]];
         NSUInteger wordCount = 0;
         for (NSString *w in words) if (w.length) wordCount++;
         if (wordCount >= 3) {
             NSSet<NSString *> *displayTokens = wq_name_tokens(name);
-            NSSet<NSString *> *bundleTokens = wq_name_tokens(bundleName);
             BOOL shares = NO;
-            for (NSString *t in displayTokens) {
-                if ([bundleTokens containsObject:t]) { shares = YES; break; }
+            if (bundleName.length) {
+                NSSet<NSString *> *bundleTokens = wq_name_tokens(bundleName);
+                for (NSString *t in displayTokens) {
+                    if ([bundleTokens containsObject:t]) { shares = YES; break; }
+                }
+            }
+            if (!shares && bundleID.length) {
+                NSSet<NSString *> *idTokens = wq_bundle_id_tokens(bundleID);
+                for (NSString *t in displayTokens) {
+                    if ([idTokens containsObject:t]) { shares = YES; break; }
+                }
             }
             if (!shares) return NO;
         }
@@ -1092,29 +1207,49 @@ static NSArray<NSString *> *wq_lproj_candidates(NSString *language)
     return out;
 }
 
+// First-8 note counters. These are file-scope (not function-statics) so
+// wq_bundle_display_note_reset can clear them when the log is cleared:
+// previously the counters were never reset, so after the user cleared the
+// log once, no "names: bundle:" or "names: lsapi:" line could ever
+// reappear, which hid whether the bundle route was working.
+static NSUInteger gWQBundleDisplayNotes;
+static NSMutableDictionary<NSString *, NSNumber *> *gWQNameSourceCounts;
+
 // The first few bundle-name resolutions go to the Log, so a device run
 // shows whether the bundle (not the LaunchServices store) supplied a name.
 static void wq_bundle_display_note(NSString *bundleID, NSString *name)
 {
-    static NSUInteger notes;
     @synchronized (NSNull.null) {
-        if (notes >= 8) return;
-        notes++;
+        if (gWQBundleDisplayNotes >= 8) return;
+        gWQBundleDisplayNotes++;
     }
     wq_log(@"names: bundle: %@ -> %@", bundleID, name);
+}
+
+// Reset the first-8 note counters so that after the log is cleared, a
+// fresh run logs them again. Called from wq_log_clear.
+void wq_bundle_display_note_reset(void)
+{
+    @synchronized (NSNull.null) {
+        gWQBundleDisplayNotes = 0;
+    }
+    @synchronized (NSNull.null) {
+        [gWQNameSourceCounts removeAllObjects];
+    }
 }
 
 // Log the first few entries of a name source so a device log shows what it
 // returned (and whether it returned anything at all). Counted per source.
 static void wq_name_source_note(NSString *kind, NSString *bundleID, NSString *name, NSString *path)
 {
-    static NSMutableDictionary<NSString *, NSNumber *> *counts;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ counts = [NSMutableDictionary new]; });
-    @synchronized (counts) {
-        NSUInteger n = counts[kind].unsignedIntegerValue;
+    dispatch_once(&once, ^{ gWQNameSourceCounts = [NSMutableDictionary new]; });
+    // Same lock as wq_bundle_display_note_reset (NSNull.null), so the reset
+    // and the note cannot race on the counts dict.
+    @synchronized (NSNull.null) {
+        NSUInteger n = gWQNameSourceCounts[kind].unsignedIntegerValue;
         if (n >= 8) return;
-        counts[kind] = @(n + 1);
+        gWQNameSourceCounts[kind] = @(n + 1);
     }
     wq_log(@"names: %@: %@ -> %@ (%@)", kind, bundleID, name ?: @"-", path ?: @"-");
 }
@@ -1312,13 +1447,44 @@ static NSString *wq_bundle_display_name(NSString *bundleID)
     return resolved;
 }
 
+// Whether a store bundle name (CFBundleName) is a sane internal identifier:
+// a single token or camelCase name, not a description, a UTI, or a string
+// in the wrong language. A bundle name that fails this check comes from a
+// misaligned record and must not be shown: the caller falls back to the
+// parent app or the bundle id instead of showing it.
+static BOOL wq_bundle_name_ok(NSString *name)
+{
+    if (!name.length) return NO;
+    if ([name hasPrefix:@"public."]) return NO;
+    if ([name rangeOfString:@".app-category"].location != NSNotFound) return NO;
+    if ([name rangeOfString:@"simula" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
+    if (wq_name_is_device_model(name)) return NO;
+    if ([name rangeOfString:@"\uFFFD"].location != NSNotFound) return NO;
+    if (!wq_name_script_ok(name)) return NO;
+    // A bundle name is one token (possibly camelCase), not a phrase.
+    NSArray<NSString *> *words = [name componentsSeparatedByCharactersInSet:
+                                  [NSCharacterSet whitespaceCharacterSet]];
+    NSUInteger wordCount = 0;
+    for (NSString *w in words) if (w.length) wordCount++;
+    if (wordCount >= 3) return NO;
+    return YES;
+}
+
 static NSString *wq_known_name(NSString *bundleID, WQLSSnapshot *snapshot)
 {
     NSString *builtin = wq_builtin_names()[bundleID];
     if (builtin) return builtin;
     NSString *display = snapshot.display[bundleID];
-    if (display && wq_ls_display_plausible(display, snapshot.bundleName[bundleID])) return display;
-    return snapshot.bundleName[bundleID];
+    NSString *bname = snapshot.bundleName[bundleID];
+    // Name priority (user directive): a trustworthy Chinese display name
+    // first, then the correct English bundle name, never a wrong-language
+    // string. A plausible display name wins when it is one (a Chinese
+    // display name always passes the plausibility check); a suspect
+    // display name falls through to the bundle name, and a bundle name
+    // that is itself not sane is not shown at all.
+    if (display && wq_ls_display_plausible(display, bname, bundleID)) return display;
+    if (bname.length && wq_bundle_name_ok(bname)) return bname;
+    return nil;
 }
 
 BOOL wq_display_names_loaded(void)

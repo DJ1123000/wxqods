@@ -176,6 +176,60 @@ static void TestContainerMapping(NSString *path)
     WQCheck([wq_display_name(@"com.example.app") isEqualToString:@"AppName8"]);
 }
 
+// A store whose display name is displayName but whose bundle-name field is
+// absent (ref 0), so the bundle name is unknown: the plausibility check
+// must still reject a descriptive display name using the bundle id alone.
+static NSData *StoreWithNameNoBundleName(NSString *displayName)
+{
+    const NSUInteger recordOffset = 0x200;
+    const NSUInteger idOffset = 0x1000;
+    const NSUInteger displayOffset = 0x1080;
+    NSMutableData *data = [NSMutableData dataWithLength:0x2000];
+    uint8_t *bytes = data.mutableBytes;
+    memcpy(bytes, "bdsl", 4);
+    Put32(data, recordOffset + 4, 0x250);
+    Put32(data, recordOffset + 8 + 0x0c, 1u << 2);
+    // Name field at +0x6c intentionally left 0 (no bundle name).
+    Put32(data, recordOffset + 8 + 0x74, 2u << 2);
+
+    NSArray<NSString *> *values = @[@"com.example.international", displayName];
+    NSArray<NSNumber *> *offsets = @[@(idOffset), @(displayOffset)];
+    for (NSUInteger i = 0; i < values.count; i++) {
+        NSData *utf8 = [values[i] dataUsingEncoding:NSUTF8StringEncoding];
+        NSUInteger offset = offsets[i].unsignedIntegerValue;
+        Put32(data, offset, (uint32_t)(i + 1));
+        Put32(data, offset + 4, (uint32_t)utf8.length);
+        memcpy(bytes + offset + 8, utf8.bytes, utf8.length);
+        bytes[offset + 8 + utf8.length] = 0;
+    }
+    return data;
+}
+
+// A 0xe8-byte bundle record (the iOS 26.4.1 layout): bundle id at +0x0c,
+// container at +0x60, bundle name at +0x64, display name at +0x6c,
+// bundle path at +0x00.
+static NSData *StoreWith26_4Record(NSString *bundleID, NSString *bundleName, NSString *displayName)
+{
+    const NSUInteger recordOffset = 0x200;
+    const NSUInteger idOffset = 0x1000, containerOffset = 0x1100, nameOffset = 0x1040;
+    const NSUInteger displayOffset = 0x1080, pathOffset = 0x1180;
+    NSMutableData *data = [NSMutableData dataWithLength:0x2000];
+    uint8_t *bytes = data.mutableBytes;
+    memcpy(bytes, "bdsl", 4);
+    Put32(data, recordOffset + 4, 0x0e8);
+    Put32(data, recordOffset + 8 + 0x00, 6u << 2);   // bundle path
+    Put32(data, recordOffset + 8 + 0x0c, 1u << 2);   // bundle id
+    Put32(data, recordOffset + 8 + 0x60, 2u << 2);   // container path
+    Put32(data, recordOffset + 8 + 0x64, 3u << 2);   // bundle name
+    Put32(data, recordOffset + 8 + 0x6c, 4u << 2);   // display name
+    PutString(data, idOffset, 1, bundleID);
+    PutString(data, containerOffset, 2, kAppPath);
+    PutString(data, nameOffset, 3, bundleName);
+    PutString(data, displayOffset, 4, displayName);
+    PutString(data, pathOffset, 6, @"/private/var/containers/Bundle/Application/4CE791DB-6B04-4A39-8F59-AF32BA61D494/Example.app");
+    return data;
+}
+
 static void TestDisplayNamePlausibility(NSString *path)
 {
     // A UTI / App Store category is not an app name: fall back to the bundle name.
@@ -212,6 +266,14 @@ static void TestDisplayNamePlausibility(NSString *path)
     // A two-word name is a plausible app name even without a shared word.
     WriteData(StoreWithName(@"App Store"), path);
     WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"App Store"]);
+    // A descriptive display name is still rejected when the bundle name is
+    // unknown (no bundle-name field in the store): the bundle id alone
+    // must not let it through. The name falls back to nothing here (the
+    // caller shows the bundle id), never to the garbage string.
+    WriteData(StoreWithNameNoBundleName(@"Kod sumber Fortran"), path);
+    WQCheck(wq_display_name(@"com.example.international") == nil);
+    WriteData(StoreWithNameNoBundleName(@"preprocessed C source code"), path);
+    WQCheck(wq_display_name(@"com.example.international") == nil);
 }
 
 static NSString *WriteTestBundle(NSString *displayName, NSString *localizedName)
@@ -285,6 +347,24 @@ static void TestBundleDisplayName(NSString *path)
     [[NSFileManager defaultManager] removeItemAtPath:bundle error:nil];
 }
 
+static void Test26_4Layout(NSString *path)
+{
+    // A 0xe8-byte record resolves through the 26.4 layout: the container
+    // maps, and the name comes from its display-name field.
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"微信"), path);
+    [NSUserDefaults.standardUserDefaults setObject:path forKey:@"WQLaunchServicesStore"];
+    // A Chinese display name wins (Chinese first).
+    WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"微信"]);
+    WQCheck([wq_bundle_id_for_container(kAppPath) isEqualToString:@"com.example.eight"]);
+    // A garbage display name in a 0xe8 record falls back to the English
+    // bundle name, never the garbage.
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"Kod sumber Fortran"), path);
+    WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"WeChat"]);
+    // A plausible English display name still wins.
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"WeChat"), path);
+    WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"WeChat"]);
+}
+
 static void TestOversizedStoreFailsClosed(NSString *path)
 {
     int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -309,6 +389,7 @@ int main(void)
             TestContainerMapping(path);
             TestDisplayNamePlausibility(path);
             TestBundleDisplayName(path);
+            Test26_4Layout(path);
             TestOversizedStoreFailsClosed(path);
         } @finally {
             [[NSFileManager defaultManager] removeItemAtPath:path error:nil];

@@ -133,3 +133,111 @@ was found instead of an empty screen.
   instead of a bare blank, so the empty state reads sensibly. Share
   still shares the same `fullLog` (header + body, or the placeholder
   when empty).
+
+---
+
+# Follow-up: CN3 cache scan finds only 6 items (regression, 2026-11-11)
+
+## What the user saw
+
+On CN2 the cache scan found 210 items / 20.25 GB. On CN3 it found
+only 6 items / 2.8 MB, all tiny (900 KB, 506 KB, 469 KB, 409 KB,
+401 KB, 131 KB), all selected. The multi-GB items (WeChat 1.16 GB
+cache, QQ 1.14 GB, etc.) were gone entirely — not shown as limited or
+unselected, just absent. The user did not clean successfully in
+between, so the cache was still there; the scan itself was missing
+almost everything.
+
+## What was ruled out (code + device log)
+
+- **Enumeration is healthy.** The device log shows the app scan
+  enumerating 314 containers / 313 apps measured, and the shared scan
+  is slot-cached, so `wq_enumerate` returns the full list. The log
+  also confirms the LS store parse works. The regression is in the
+  cache scan's own measurement/publish path, not in enumeration.
+- **Measurement is honest.** `wq_measure_tree_impl` returns real byte
+  counts; a container it cannot read returns `Limited`, and a limited
+  container is still listed (as a limited row), not dropped. The
+  `< 64 KB` skip only applies when both Caches and tmp are *Known*
+  and sum to < 64 KB, so it cannot drop a GB-sized cache. The size
+  cache shared with the Apps screen stores real per-bucket subtotals
+  (both screens use `wq_measure_tree_subtotals`), so a warm cache
+  cannot zero out a big item either.
+- **The "keep previous list" logic cannot stick a small list.** It
+  only fires when the new scan found 0 items *and* a root enumeration
+  failed *and* a previous list exists; a scan that found 6 items
+  replaces the list with those 6. So the 6 items are this scan's own
+  (partial) result.
+
+## Root cause
+
+The 6 items are a **partial result from a scan interrupted
+mid-measurement, which was then never completed**. The CN3 restructure
+made interrupted scans publish partial results (correct), but nothing
+retried them:
+
+1. The user was testing the background-switch fix, so the scan was
+   interrupted — by the background-task expiration (iOS grants ~30 s;
+   the handler cancels the scan) and/or by `viewWillDisappear` when
+   navigating away in-app. The scan broke out of the container loop
+   after measuring only the first few containers and published them
+   (6 items, all small because they are the first in enumeration
+   order, not the largest).
+2. After publishing, `_scanning = NO` and `_lastScanFinished` is set,
+   so `viewWillAppear` does **not** restart it (it only restarts a
+   scan that is still `_scanning` and cancelled, or one finished
+   > 60 s ago). The screen therefore sits on the partial 6-item list
+   indefinitely until the user pulls to refresh or re-enters after a
+   minute. To the user that reads as "the scan only finds 6 items".
+
+A second, narrower defect in the same area: the expiration handler
+read the *current* `_scanCancellation` / `_cleanCancellation` ivar at
+fire time. A background task registered by a superseded scan can
+therefore cancel the *newer* scan that adopted the task (the publish
+block returns early on a generation mismatch without ending the task,
+so the next scan's `WQCacheBeginBackgroundTask` returns early and the
+old task — and its handler — stays live). That is a real race, though
+it needs a superseded scan plus a > 30 s backgrounding to fire.
+
+## What I changed (`WQCache.m`)
+
+- **An interrupted scan now restarts itself (bounded).** In the
+  publish block, if the scan was interrupted and the user is still
+  looking at the screen (foreground, view in a window) and no clean
+  is running, the scan restarts after 0.5 s, up to 3 consecutive
+  auto-restarts (`_interruptedRestarts`, reset on a complete scan and
+  on a user-initiated rescan in `viewWillAppear` / `userRefresh`). A
+  scan that keeps being interrupted stops retrying; the user can still
+  pull to refresh. This fixes the stuck-at-6-items symptom regardless
+  of what interrupted the first pass.
+- **The expiration handler cancels only its own token.** Both the
+  scan and the clean handlers now capture the `WQScanCancellation`
+  created for that run (`[cancellation cancel]`) instead of reading
+  `_scanCancellation` / `_cleanCancellation` at fire time. A stale
+  task can no longer kill a newer scan. The cross-cancellation (scan
+  handler cancelling the clean and vice versa) is removed: each run
+  is protected by its own task, and scan/clean never overlap (the UI
+  prevents it), so the cross-cancel was redundant.
+- **Diagnostic log line.** The publish block now logs
+  `cache scan: found N items (X), interrupted=0/1, failed
+  enumerations=N, kept previous=0/1`, so the next device log shows
+  exactly what a scan found and why, instead of leaving the cause to
+  be inferred from the item count.
+
+The background-task and log-clear changes from §1–2 are untouched
+(the user has not reported them broken; the log-clear button was
+confirmed working on-device).
+
+## What to check on-device after installing (CN4)
+
+1. Open Cache Cleanup and let the scan finish: it should again find
+   ~210 items / ~20 GB (the 6-item result should not recur). If it
+   still shows few items, send the `cache scan: found …` log line —
+   it says whether the scan was interrupted, whether an enumeration
+   failed, and whether the previous list was kept.
+2. Switch to another app mid-scan and come back: the list should
+   complete by itself (auto-restart) instead of sticking at a partial
+   count, and the log should show the interrupted scan followed by a
+   completing one.
+3. The background-switch and log-clear behaviour from §1–2 is
+   unchanged; re-verify only if the user reports a problem there.

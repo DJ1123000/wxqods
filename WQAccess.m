@@ -78,6 +78,10 @@ void wq_log_clear(void)
     [gLogLock lock];
     [gLog setString:@""];
     [gLogLock unlock];
+    // Let the "names:" first-8 notes reappear on a fresh run: their
+    // counters live in WQLaunchServices and were never reset, so after one
+    // clear no "names: bundle:" line could ever show again.
+    wq_bundle_display_note_reset();
 }
 
 static NSString *wq_errno(int err) { return [NSString stringWithFormat:@"%s (errno %d)", strerror(err), err]; }
