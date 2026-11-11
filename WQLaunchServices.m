@@ -883,25 +883,136 @@ static NSDictionary<NSString *, NSString *> *wq_builtin_names(void)
             @"com.apple.AMSEngagementViewService": @"Apple 媒体服务",
             @"com.apple.appManagedFeatures.Restrictions": @"访问限制", @"com.apple.CarRadio": @"车载收音机",
             @"com.apple.PassbookUIService": @"钱包面板", @"com.apple.Spotlight": @"聚焦搜索", @"com.apple.InputUI": @"键盘",
-            // Third-party apps: on iOS 26 the LaunchServices store often yields a
-            // wrong-language string as the display name, so these well-known ids
-            // are pinned to their real names and checked before the store.
-            @"com.tencent.xin": @"微信", @"com.tencent.mm": @"微信", @"com.tencent.mqq": @"QQ",
-            @"com.tencent.QQMusic": @"QQ音乐", @"com.ss.iphone.ugc.Aweme": @"抖音",
-            @"com.netease.cloudmusic": @"网易云音乐", @"com.taobao.fleamarket": @"闲鱼",
-            @"com.atebits.Tweetie2": @"X", @"com.google.chrome.ios": @"Chrome",
-            @"com.sina.weibo": @"微博", @"com.alibaba.iphone.taobao": @"淘宝",
-            @"com.zhihu.ios": @"知乎", @"com.baidu.ios": @"百度",
-            @"com.autonavi.amap": @"高德地图", @"com.meituan.iphone": @"美团",
-            @"com.tencent.map": @"腾讯地图", @"com.dianping.iphone": @"大众点评",
         };
     });
     return names;
 }
 
+// A LaunchServices display name that is not a name at all. The store's
+// string table holds many kinds of strings, and on iOS 26.4 the
+// display-name field of the winning layout points at one of those instead
+// of the app's name: a UTI ("public.app-category.music-games"), an App
+// Store category, or text that did not decode (replacement characters).
+// Such a value is worse than the bundle name, so the caller falls through.
+static BOOL wq_ls_display_plausible(NSString *name)
+{
+    if (!name.length) return NO;
+    if ([name rangeOfString:@"\uFFFD"].location != NSNotFound) return NO;
+    if ([name hasPrefix:@"public."]) return NO;
+    if ([name rangeOfString:@".app-category"].location != NSNotFound) return NO;
+    static NSCharacterSet *notIdentifierChars;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        notIdentifierChars = [[NSCharacterSet characterSetWithCharactersInString:
+                               @"abcdefghijklmnopqrstuvwxyz0123456789.-"] invertedSet];
+    });
+    if (name.length > 3 &&
+        [name rangeOfCharacterFromSet:notIdentifierChars].location == NSNotFound) {
+        NSUInteger dots = [[name componentsSeparatedByString:@"."] count] - 1;
+        if (dots >= 2) return NO;
+    }
+    return YES;
+}
+
+// .lproj directory names to try for a preferred language, most specific
+// first. "zh-Hans-CN" -> zh-Hans-CN, zh-Hans, zh (plus underscore forms);
+// "en-US" -> en-US, en. The device's preferred languages are tried in order.
+static NSArray<NSString *> *wq_lproj_candidates(NSString *language)
+{
+    if (!language.length) return @[];
+    NSArray<NSString *> *parts = [language componentsSeparatedByString:@"-"];
+    NSMutableArray<NSString *> *out = [NSMutableArray new];
+    for (NSInteger i = (NSInteger)parts.count; i >= 1; i--) {
+        NSString *candidate = [[parts subarrayWithRange:NSMakeRange(0, (NSUInteger)i)]
+                               componentsJoinedByString:@"-"];
+        if (![out containsObject:candidate]) [out addObject:candidate];
+    }
+    NSString *underscored = [language stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
+    if (![out containsObject:underscored]) [out addObject:underscored];
+    if (parts.count >= 2) {
+        NSString *two = [[parts subarrayWithRange:NSMakeRange(0, 2)] componentsJoinedByString:@"_"];
+        if (![out containsObject:two]) [out addObject:two];
+    }
+    return out;
+}
+
+// The first few bundle-name resolutions go to the Log, so a device run
+// shows whether the bundle (not the LaunchServices store) supplied a name.
+static void wq_bundle_display_note(NSString *bundleID, NSString *name)
+{
+    static NSUInteger notes;
+    @synchronized (NSNull.null) {
+        if (notes >= 8) return;
+        notes++;
+    }
+    wq_log(@"names: bundle: %@ -> %@", bundleID, name);
+}
+
+// The display name from the app bundle itself. Info.plist carries
+// CFBundleDisplayName (and CFBundleName as a fallback); the localized form
+// lives in <language>.lproj/InfoPlist.strings under the CFBundleDisplayName
+// key. This is the name SpringBoard shows, and the same file the icon
+// loader already reads (with a worse_query grant when needed), so it does
+// not depend on the LaunchServices record layout that iOS 26.4 broke.
+// Resolved names are cached by bundle path; a reinstalled app gets a new
+// path, so a stale entry is never reused. Returns nil when the bundle
+// cannot be read, and the caller falls back to the store.
+static NSString *wq_bundle_display_name(NSString *bundleID, WQLSSnapshot *snapshot)
+{
+    NSString *bundlePath = snapshot.bundlePaths[bundleID];
+    if (![bundlePath isKindOfClass:NSString.class] || !bundlePath.length) return nil;
+    static NSMutableDictionary<NSString *, id> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    @synchronized (cache) {
+        id hit = cache[bundlePath];
+        if ([hit isKindOfClass:NSString.class]) return hit;
+        if (hit == NSNull.null) return nil;
+    }
+    NSString *resolved = nil;
+    NSString *plistPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    if (!info && wq_grant(bundlePath)) info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    if ([info isKindOfClass:NSDictionary.class]) {
+        for (NSString *language in [NSLocale preferredLanguages]) {
+            for (NSString *lproj in wq_lproj_candidates(language)) {
+                NSString *stringsPath = [[bundlePath stringByAppendingPathComponent:
+                                          [lproj stringByAppendingString:@".lproj"]]
+                                         stringByAppendingPathComponent:@"InfoPlist.strings"];
+                NSDictionary *strings = [NSDictionary dictionaryWithContentsOfFile:stringsPath];
+                NSString *localized = [strings isKindOfClass:NSDictionary.class] ?
+                    strings[@"CFBundleDisplayName"] : nil;
+                if ([localized isKindOfClass:NSString.class]) {
+                    resolved = wq_safe_name(localized);
+                    if (resolved) break;
+                }
+            }
+            if (resolved) break;
+        }
+        if (!resolved) {
+            NSString *display = info[@"CFBundleDisplayName"];
+            if ([display isKindOfClass:NSString.class]) resolved = wq_safe_name(display);
+        }
+        if (!resolved) {
+            NSString *name = info[@"CFBundleName"];
+            if ([name isKindOfClass:NSString.class]) resolved = wq_safe_name(name);
+        }
+    }
+    @synchronized (cache) {
+        if (cache.count > 4096) [cache removeAllObjects];
+        cache[bundlePath] = resolved ?: NSNull.null;
+    }
+    if (resolved) wq_bundle_display_note(bundleID, resolved);
+    return resolved;
+}
+
 static NSString *wq_known_name(NSString *bundleID, WQLSSnapshot *snapshot)
 {
-    return wq_builtin_names()[bundleID] ?: snapshot.display[bundleID] ?: snapshot.bundleName[bundleID];
+    NSString *builtin = wq_builtin_names()[bundleID];
+    if (builtin) return builtin;
+    NSString *display = snapshot.display[bundleID];
+    if (display && wq_ls_display_plausible(display)) return display;
+    return snapshot.bundleName[bundleID];
 }
 
 BOOL wq_display_names_loaded(void)
@@ -938,16 +1049,27 @@ NSString *wq_bundle_id_for_container(NSString *path)
 NSString *wq_display_name(NSString *bundleID)
 {
     if (!bundleID) return nil;
+    // A label with stray whitespace (seen from a container attribute) would
+    // miss every exact lookup; trim it before resolving.
+    NSString *bid = [bundleID stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!bid.length) return nil;
     // One snapshot for the whole call: the store cannot change under us
     // mid-lookup, and parent fallbacks do not re-trigger a load each time.
     WQLSSnapshot *snapshot = wq_ls_ensure_snapshot(nil, NO);
-    NSString *name = wq_known_name(bundleID, snapshot);
+    // The bundle's own localized name first: it is the name SpringBoard
+    // shows, and it does not depend on the LaunchServices record layout.
+    NSString *fromBundle = wq_bundle_display_name(bid, snapshot);
+    if (fromBundle) return fromBundle;
+    NSString *name = wq_known_name(bid, snapshot);
     if (name) return name;
     // Unknown id: use the closest parent app (com.apple.news.widget -> News).
-    NSArray *parts = [bundleID componentsSeparatedByString:@"."];
+    // The parent gets the same full resolution (bundle first), so a widget
+    // of a third-party app still shows its app's name.
+    NSArray *parts = [bid componentsSeparatedByString:@"."];
     for (NSInteger n = (NSInteger)parts.count - 1; n >= 2; n--) {
         NSString *prefix = [[parts subarrayWithRange:NSMakeRange(0, (NSUInteger)n)] componentsJoinedByString:@"."];
-        NSString *parent = wq_known_name(prefix, snapshot);
+        NSString *parent = wq_display_name(prefix);
         if (parent) {
             NSString *suffix = wq_safe_name(parts.lastObject);
             return suffix.length ? [NSString stringWithFormat:@"%@ \u2013 %@", parent, suffix] : parent;
