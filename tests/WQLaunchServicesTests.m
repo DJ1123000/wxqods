@@ -112,7 +112,10 @@ static void TestRefreshAndUnicodeSafety(NSString *path)
     WQCheck(wq_display_name(@"com.example.international") == nil);
 
     WriteData(StoreWithName(@"Fresh name"), path);
-    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Fresh name"]);
+    // CN6: a non-Chinese store display name is never used, even a
+    // plausible one — the bundle name wins (on device the bundle-path
+    // folder name would win first).
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
 }
 
 static void PutString(NSMutableData *data, NSUInteger offset, uint32_t sid, NSString *value)
@@ -208,7 +211,7 @@ static NSData *StoreWithNameNoBundleName(NSString *displayName)
 // A 0xe8-byte bundle record (the iOS 26.4.1 layout): bundle id at +0x0c,
 // container at +0x60, bundle name at +0x64, display name at +0x6c,
 // bundle path at +0x00.
-static NSData *StoreWith26_4Record(NSString *bundleID, NSString *bundleName, NSString *displayName)
+static NSData *StoreWith26_4Record(NSString *bundleID, NSString *bundleName, NSString *displayName, NSString *bundlePath)
 {
     const NSUInteger recordOffset = 0x200;
     const NSUInteger idOffset = 0x1000, containerOffset = 0x1100, nameOffset = 0x1040;
@@ -226,7 +229,7 @@ static NSData *StoreWith26_4Record(NSString *bundleID, NSString *bundleName, NSS
     PutString(data, containerOffset, 2, kAppPath);
     PutString(data, nameOffset, 3, bundleName);
     PutString(data, displayOffset, 4, displayName);
-    PutString(data, pathOffset, 6, @"/private/var/containers/Bundle/Application/4CE791DB-6B04-4A39-8F59-AF32BA61D494/Example.app");
+    PutString(data, pathOffset, 6, bundlePath);
     return data;
 }
 
@@ -260,12 +263,15 @@ static void TestDisplayNamePlausibility(NSString *path)
     WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
     WriteData(StoreWithName(@"रेसिंग गेम"), path);
     WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
-    // A multi-word name that shares a word with the bundle name is real.
+    // CN6: a non-Chinese store display name is never used, even when it
+    // shares a word with the bundle name ("Example App Pro") or is a
+    // plausible two-word name ("App Store") — the bundle name wins (on
+    // device the bundle-path folder name would win first). Only a Chinese
+    // display name is trusted from the store.
     WriteData(StoreWithName(@"Example App Pro"), path);
-    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example App Pro"]);
-    // A two-word name is a plausible app name even without a shared word.
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
     WriteData(StoreWithName(@"App Store"), path);
-    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"App Store"]);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
     // A descriptive display name is still rejected when the bundle name is
     // unknown (no bundle-name field in the store): the bundle id alone
     // must not let it through. The name falls back to nothing here (the
@@ -351,18 +357,77 @@ static void Test26_4Layout(NSString *path)
 {
     // A 0xe8-byte record resolves through the 26.4 layout: the container
     // maps, and the name comes from its display-name field.
-    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"微信"), path);
+    NSString *wechatPath = @"/private/var/containers/Bundle/Application/4CE791DB-6B04-4A39-8F59-AF32BA61D494/WeChat.app";
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"微信", wechatPath), path);
     [NSUserDefaults.standardUserDefaults setObject:path forKey:@"WQLaunchServicesStore"];
     // A Chinese display name wins (Chinese first).
     WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"微信"]);
     WQCheck([wq_bundle_id_for_container(kAppPath) isEqualToString:@"com.example.eight"]);
-    // A garbage display name in a 0xe8 record falls back to the English
-    // bundle name, never the garbage.
-    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"Kod sumber Fortran"), path);
+    // A garbage display name in a 0xe8 record falls back to the
+    // bundle-path folder name, never the garbage (CN6: the store display
+    // is only trusted when it is Chinese).
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"Kod sumber Fortran", wechatPath), path);
     WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"WeChat"]);
-    // A plausible English display name still wins.
-    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"WeChat"), path);
+    // A non-Chinese display name is never used, even a plausible one: the
+    // bundle-path folder name wins.
+    WriteData(StoreWith26_4Record(@"com.example.eight", @"WeChat", @"WeChat", wechatPath), path);
     WQCheck([wq_display_name(@"com.example.eight") isEqualToString:@"WeChat"]);
+}
+
+// CN6: every garbage display name observed on the device on CN5 must fall
+// back to the bundle-path folder name (or the bundle id when there is no
+// path), never to the garbage string. The store display name is only
+// trusted when it is Chinese. The bundle path is a fake device path: the
+// Info.plist inside it does not exist on the test host, so the bundle
+// route returns nil and the folder name is what resolves — exactly the
+// on-device situation for a third-party app on 26.4.1.
+// Each case is (bundle id, bundle name, store display, bundle path, expected).
+static void TestCN6GarbageFallback(NSString *path)
+{
+    NSArray<NSArray<NSString *> *> *cases = @[
+        @[@"com.tencent.xin", @"WeChat", @"Kod sumber Fortran",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000001/WeChat.app", @"WeChat"],
+        @[@"hossin.asaadi.V2Box", @"V2Box", @"VNC interneto vieta",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000002/V2Box.app", @"V2Box"],
+        @[@"app.hiddify", @"Hiddify", @"vị trí web trên internet",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000003/Hiddify.app", @"Hiddify"],
+        @[@"com.example.maxpod", @"MaxPod", @"Código de encabezado C",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000004/MaxPod.app", @"MaxPod"],
+        @[@"com.example.uzvideo", @"UzVideo", @"kommaadskilte værdier",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000005/UzVideo.app", @"UzVideo"],
+        @[@"com.apple.SOSBuddy", @"SOSBuddy", @"čtyřznakový kód",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000006/SOSBuddy.app", @"SOSBuddy"],
+        @[@"com.example.spoofer", @"LocationSpoofer", @"Sporto žaidimai",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000007/LocationSpoofer.app", @"LocationSpoofer"],
+        @[@"com.ownbook.notes", @"Notes", @"text/x-uuencode",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000008/Notes.app", @"Notes"],
+        @[@"com.example.arrivo", @"Arrivo", @"csv_145x145@2x.png",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000009/Arrivo.app", @"Arrivo"],
+        @[@"com.example.nomad", @"Nomad", @"EPUB 발행물",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000010/Nomad.app", @"Nomad"],
+        @[@"com.google.keyboard", @"Gboard", @"PlugInKit-liitännäinen",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000011/Gboard.app", @"Gboard"],
+        @[@"com.example.refresh", @"GlobalRefresh", @"ARKit-viitelisälaite",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000012/GlobalRefresh.app", @"GlobalRefresh"],
+        // The user's own example: Taobao comes from the directory.
+        @[@"com.taobao.taobao4iphone", @"Taobao", @"Kod sumber Fortran",
+          @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000013/Taobao.app", @"Taobao"],
+    ];
+    for (NSArray<NSString *> *c in cases) {
+        WriteData(StoreWith26_4Record(c[0], c[1], c[2], c[3]), path);
+        WQCheck([wq_display_name(c[0]) isEqualToString:c[4]]);
+    }
+    // A Chinese display name still wins over the folder name.
+    WriteData(StoreWith26_4Record(@"com.tencent.xin", @"WeChat", @"微信",
+              @"/private/var/containers/Bundle/Application/AAAAAAAA-0000-0000-0000-000000000001/WeChat.app"), path);
+    WQCheck([wq_display_name(@"com.tencent.xin") isEqualToString:@"微信"]);
+    // A two-word foreign phrase is rejected even without a bundle path:
+    // the bundle name wins, and with no bundle name at all the caller
+    // shows the bundle id (nil here), never the phrase.
+    WriteData(StoreWithNameNoBundleName(@"Sporto žaidimai"), path);
+    WQCheck(wq_display_name(@"com.example.international") == nil);
+    WriteData(StoreWithNameNoBundleName(@"vị trí web trên internet"), path);
+    WQCheck(wq_display_name(@"com.example.international") == nil);
 }
 
 static void TestOversizedStoreFailsClosed(NSString *path)
@@ -390,6 +455,7 @@ int main(void)
             TestDisplayNamePlausibility(path);
             TestBundleDisplayName(path);
             Test26_4Layout(path);
+            TestCN6GarbageFallback(path);
             TestOversizedStoreFailsClosed(path);
         } @finally {
             [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
