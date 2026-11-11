@@ -2238,8 +2238,11 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
     _textView.editable = NO;
     _textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     [self.view addSubview:_textView];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
-                                                                                           target:self action:@selector(share:)];
+    UIBarButtonItem *clear = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:UIBarButtonItemStylePlain
+                                                                target:self action:@selector(clearLog:)];
+    UIBarButtonItem *share = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                                                           target:self action:@selector(share:)];
+    self.navigationItem.rightBarButtonItems = @[clear, share];
 }
 
 // App version, device and iOS first, so a Log someone sends in says where it
@@ -2247,8 +2250,10 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
 - (NSString *)fullLog
 {
     NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *log = wq_log_text();
+    if (!log.length) log = @"（日志为空）";
     return [NSString stringWithFormat:@"WQ Files %@ (%@)\n%@\n\n%@",
-            info[@"CFBundleShortVersionString"] ?: @"?", info[@"CFBundleVersion"] ?: @"?", wq_device_line(), wq_log_text()];
+            info[@"CFBundleShortVersionString"] ?: @"?", info[@"CFBundleVersion"] ?: @"?", wq_device_line(), log];
 }
 
 - (void)viewWillAppear:(BOOL)animated
@@ -2263,6 +2268,18 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
                                                                         applicationActivities:nil];
     share.popoverPresentationController.barButtonItem = sender;
     [self presentViewController:share animated:YES completion:nil];
+}
+
+- (void)clearLog:(UIBarButtonItem *__unused)sender
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志" message:@"确定要清空日志吗？"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *__unused a) {
+        wq_log_clear();
+        self->_textView.text = [self fullLog];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
