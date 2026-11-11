@@ -1,0 +1,9 @@
+build/
+*.ipa
+.DS_Store
+tests/.build/
+__pycache__/
+*.py[cod]
+.work/
+.manus/
+outputs/
