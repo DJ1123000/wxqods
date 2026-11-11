@@ -84,6 +84,15 @@ void wq_log_clear(void)
     wq_bundle_display_note_reset();
 }
 
+#ifdef WQ_ACCESS_TESTING
+// Test double: the test binaries compile WQAccess.m without
+// WQLaunchServices.m, so the real wq_bundle_display_note_reset (defined
+// there) is not linked. The reset only clears "names:" note counters;
+// a no-op is correct for tests. (Same pattern as the wq_grant double
+// in tests/WQLaunchServicesTests.m.)
+void wq_bundle_display_note_reset(void) {}
+#endif
+
 static NSString *wq_errno(int err) { return [NSString stringWithFormat:@"%s (errno %d)", strerror(err), err]; }
 
 #pragma mark - App group
