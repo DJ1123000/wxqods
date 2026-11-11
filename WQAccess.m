@@ -72,6 +72,14 @@ NSString *wq_log_text(void)
     return text;
 }
 
+void wq_log_clear(void)
+{
+    // Messaging nil is a no-op, so this is safe even before the first wq_log.
+    [gLogLock lock];
+    [gLog setString:@""];
+    [gLogLock unlock];
+}
+
 static NSString *wq_errno(int err) { return [NSString stringWithFormat:@"%s (errno %d)", strerror(err), err]; }
 
 #pragma mark - App group
