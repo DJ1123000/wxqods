@@ -1033,6 +1033,30 @@ static BOOL wq_name_has_cjk(NSString *name)
     return NO;
 }
 
+// Whether the name is Chinese (CN6, the FIRST validation in the user's
+// priority order). This is stricter than wq_name_has_cjk: a name that
+// contains Hiragana/Katakana (Japanese) or Hangul (Korean) is Japanese or
+// Korean, not Chinese, even when it also contains Han — e.g. "EPUB 발행물"
+// (Korean) must not pass as Chinese, and "コード" (Japanese) must not
+// either. A name counts as Chinese only when it contains a Han character
+// and no kana or Hangul. Latin letters and digits alongside the Han are
+// fine ("微信 WeChat"). A Han-only string cannot be told apart from
+// Japanese kanji by script alone ("日本" is a word in both); on this
+// user's device (Chinese locale) a Han string from the store is Chinese,
+// so Han alone is accepted here.
+static BOOL wq_name_is_chinese(NSString *name)
+{
+    if (!name.length) return NO;
+    BOOL hasHan = NO;
+    for (NSUInteger i = 0; i < name.length; i++) {
+        unichar c = [name characterAtIndex:i];
+        if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0xAC00 && c <= 0xD7AF)) return NO;
+        if ((c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||
+            (c >= 0xF900 && c <= 0xFAFF)) hasHan = YES;
+    }
+    return hasHan;
+}
+
 // Split a name into lowercase alphanumeric tokens, splitting camelCase
 // boundaries too ("AppStore" -> "app", "store"; "WeChat" -> "we", "chat").
 // Non-ASCII letters (CJK, etc.) act as separators; they are handled by the
@@ -1104,29 +1128,48 @@ static NSSet<NSString *> *wq_bundle_id_tokens(NSString *bundleID)
     return tokens;
 }
 
-// A LaunchServices display name that is not a name at all. The store's
-// string table holds many kinds of strings, and on iOS 26.4 the
-// display-name field of the winning layout points at one of those instead
-// of the app's name: a UTI ("public.app-category.music-games"), an App
-// Store category, a file-type description ("preprocessed C source code",
-// "Kod sumber Fortran"), a device model ("Macmini3,1"), a word in the
-// wrong language (Hebrew, Russian, Hindi), or text that did not decode.
-// Such a value is worse than the bundle name, so the caller falls through
-// to it.
-// bundleName is the LS bundle name (CFBundleName) for the same app: a real
-// display name is usually equal to it, a localized variant of it, or at
-// least shares a word with it. A multi-word Latin phrase with no shared
-// word is a description, not a name. The cross-check is on the
-// English/ASCII side only: a CJK name (display "微信" vs bundle name
-// "WeChat") is a legitimate localized name and always passes.
-// bundleID is the fallback cross-check when the bundle name is unknown:
-// a real display name usually shares a token with its id, while a
-// description shares none (see wq_bundle_id_tokens).
-static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSString *bundleID)
+// Hard sanity gate for any candidate name, whatever its source (CN6).
+// Rejects values that are not a name at all: a UTI / App Store category
+// ("public.app-category.music-games"), a reverse-DNS identifier, a MIME
+// type ("text/x-uuencode" — it contains "/"), a filename
+// ("csv_145x145@2x.png" — it ends in a known file extension), a simulator
+// word, a device model ("Macmini3,1"), text that did not decode (a
+// replacement character without any CJK around it), and a letter in a
+// script other than Latin or CJK. This is the gate the CN5 check was
+// missing: MIME types and filenames are single tokens, so the multi-word
+// rule below never fired on them.
+static BOOL wq_display_name_sane(NSString *name)
 {
     if (!name.length) return NO;
     if ([name hasPrefix:@"public."]) return NO;
     if ([name rangeOfString:@".app-category"].location != NSNotFound) return NO;
+    // A MIME type ("text/x-uuencode", "image/png") is a type, not a name.
+    if ([name rangeOfString:@"/"].location != NSNotFound) return NO;
+    // A filename ("csv_145x145@2x.png", "icon@2x.jpg") is a file, not a
+    // name. The extension list covers the image/audio/video/document
+    // extensions the store's string table actually holds; "@2x"/"@3x"
+    // catches Retina image names even with an unusual extension.
+    static NSSet<NSString *> *fileExtensions;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fileExtensions = [NSSet setWithObjects:
+            @"png", @"jpg", @"jpeg", @"gif", @"bmp", @"webp", @"heic", @"heif",
+            @"tif", @"tiff", @"svg", @"ico", @"mp3", @"mp4", @"m4a", @"m4v",
+            @"mov", @"avi", @"mkv", @"wav", @"flac", @"ogg", @"pdf", @"zip",
+            @"gz", @"tar", @"rar", @"7z", @"bz2", @"xz", @"doc", @"docx",
+            @"xls", @"xlsx", @"ppt", @"pptx", @"txt", @"csv", @"json", @"xml",
+            @"html", @"htm", @"css", @"js", @"plist", @"strings", @"bundle",
+            @"framework", @"dylib", @"a", @"o", @"dat", @"db", @"sqlite",
+            @"ttf", @"otf", @"woff", @"woff2", @"epub", @"mobi", nil];
+    });
+    NSString *lower = name.lowercaseString;
+    if ([lower rangeOfString:@"@2x"].location != NSNotFound ||
+        [lower rangeOfString:@"@3x"].location != NSNotFound) return NO;
+    NSRange dot = [lower rangeOfString:@"." options:NSBackwardsSearch];
+    if (dot.location != NSNotFound && dot.location + 1 < lower.length) {
+        NSString *ext = [lower substringFromIndex:dot.location + 1];
+        if ([fileExtensions containsObject:ext]) return NO;
+    }
     // A simulator word or a device model is not an app name. "simula" (not
     // "simulat") catches the Finnish "simulaattori" as well as "simulator".
     if ([name rangeOfString:@"simula" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
@@ -1139,9 +1182,10 @@ static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSStri
     // A letter in a script other than Latin or CJK is a name in the wrong
     // language, not the app's name.
     if (!wq_name_script_ok(name)) return NO;
+    // A bare reverse-DNS identifier ("com.example.something") is not a name.
     static NSCharacterSet *notIdentifierChars;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{
         notIdentifierChars = [[NSCharacterSet characterSetWithCharactersInString:
                                @"abcdefghijklmnopqrstuvwxyz0123456789.-"] invertedSet];
     });
@@ -1150,21 +1194,70 @@ static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSStri
         NSUInteger dots = [[name componentsSeparatedByString:@"."] count] - 1;
         if (dots >= 2) return NO;
     }
+    return YES;
+}
+
+// The app's name from its own bundle path (CN6, second fallback). The
+// store record's bundlePath field is known to resolve on 26.4.1
+// (e.g. /private/var/containers/Bundle/Application/<UUID>/Taobao.app),
+// and its last component is the .app folder name — a clean English name.
+// This needs no directory listing and no Info.plist read: the path string
+// itself is enough. Returns nil when the path is not a .app folder or the
+// folder stem is not a sane name.
+static NSString *wq_bundle_path_name(NSString *bundlePath)
+{
+    if (!bundlePath.length) return nil;
+    NSString *last = bundlePath.lastPathComponent;
+    if (![last hasSuffix:@".app"]) return nil;
+    NSString *stem = [last substringToIndex:last.length - 4];
+    if (!stem.length) return nil;
+    if (!wq_name_script_ok(stem)) return nil;
+    if (wq_name_is_device_model(stem)) return nil;
+    if ([stem rangeOfString:@"\uFFFD"].location != NSNotFound) return nil;
+    return stem;
+}
+
+// Whether a store display name is plausible enough to show. The store's
+// display-name field is only trusted when it is Chinese (see
+// wq_name_is_chinese and wq_display_name); this is the sanity gate for
+// that Chinese candidate. The hard rejections live in
+// wq_display_name_sane (UTIs, MIME types, filenames, device models,
+// wrong scripts). On top of that, a multi-word Latin phrase must share a
+// word with the bundle name or the bundle id, or it is a description in
+// the wrong language — and the rule fires at TWO words, not three
+// (CN6: "Sporto žaidimai", "kommaadskilte værdier" and "čtyřznakový kód"
+// are two-word foreign phrases and must be rejected just like the
+// three-word ones). The cross-check is on the English/ASCII side only:
+// a CJK name is a legitimate localized name and is not compared.
+// bundleName is the LS bundle name (CFBundleName) for the same app;
+// bundleID is the fallback cross-check when the bundle name is unknown
+// (see wq_bundle_id_tokens).
+// NOTE: the cross-check assumes the bundle name is a trustworthy
+// reference. On 26.4.1 it is not: when the winning layout is wrong, the
+// name field is itself garbage and can share a token with (or equal) the
+// display name, which defeats this check — that is the most likely path
+// by which "VNC interneto vieta" and "vị trí web trên internet" reached
+// the screen on CN5 despite the ≥3-word rule. CN6 therefore never lets a
+// non-Chinese store display name through at all; this function is only
+// the second gate for a Chinese candidate.
+static BOOL wq_ls_display_plausible(NSString *name, NSString *bundleName, NSString *bundleID)
+{
+    if (!wq_display_name_sane(name)) return NO;
     // A multi-word Latin phrase with no word in common with the bundle name
-    // is a description ("preprocessed C source code"), not a name. Only
-    // names without CJK are compared; a two-word name ("App Store",
-    // "Fresh name") is a plausible app name and is left alone. When the
-    // bundle name is unknown, the bundle id is the fallback cross-check
-    // (a real display name usually shares a token with its id, while a
-    // description shares none); a phrase that matches neither is rejected
-    // even without a bundle name to compare against, so a suspect display
-    // name never wins by default.
+    // or the bundle id is a description ("preprocessed C source code"), not
+    // a name. Only names without CJK are compared. The rule fires at two
+    // words: a two-word foreign phrase is just as wrong as a three-word
+    // one, and the old ≥3 threshold is what let the two-word CN5 garbage
+    // through. When the bundle name is unknown, the bundle id is the
+    // fallback cross-check; a phrase that matches neither is rejected even
+    // without a bundle name to compare against, so a suspect display name
+    // never wins by default.
     if (!wq_name_has_cjk(name)) {
         NSArray<NSString *> *words = [name componentsSeparatedByCharactersInSet:
                                       [NSCharacterSet whitespaceCharacterSet]];
         NSUInteger wordCount = 0;
         for (NSString *w in words) if (w.length) wordCount++;
-        if (wordCount >= 3) {
+        if (wordCount >= 2) {
             NSSet<NSString *> *displayTokens = wq_name_tokens(name);
             BOOL shares = NO;
             if (bundleName.length) {
@@ -1470,22 +1563,10 @@ static BOOL wq_bundle_name_ok(NSString *name)
     return YES;
 }
 
-static NSString *wq_known_name(NSString *bundleID, WQLSSnapshot *snapshot)
-{
-    NSString *builtin = wq_builtin_names()[bundleID];
-    if (builtin) return builtin;
-    NSString *display = snapshot.display[bundleID];
-    NSString *bname = snapshot.bundleName[bundleID];
-    // Name priority (user directive): a trustworthy Chinese display name
-    // first, then the correct English bundle name, never a wrong-language
-    // string. A plausible display name wins when it is one (a Chinese
-    // display name always passes the plausibility check); a suspect
-    // display name falls through to the bundle name, and a bundle name
-    // that is itself not sane is not shown at all.
-    if (display && wq_ls_display_plausible(display, bname, bundleID)) return display;
-    if (bname.length && wq_bundle_name_ok(bname)) return bname;
-    return nil;
-}
+// (CN6 removed wq_known_name: the store resolution — Chinese display,
+// bundle-path folder name, store bundle name — now lives in
+// wq_display_name below, in the user's priority order, so that a Chinese
+// name from any source is checked before any English name.)
 
 BOOL wq_display_names_loaded(void)
 {
@@ -1518,6 +1599,35 @@ NSString *wq_bundle_id_for_container(NSString *path)
     return [bid isKindOfClass:NSString.class] ? bid : nil;
 }
 
+// App display name, in the user's priority order (CN6). The user's
+// directive: "直接底层代码首次验证即为中文，若没有，则摘取目录内例如
+// taobao" — the FIRST validation in the underlying code is Chinese; if
+// there is no Chinese name, take the name from the app's own directory
+// (the .app folder name, e.g. Taobao). The resolution order is:
+//   1. Chinese first — from any source: the LaunchServices API's
+//      localized name, the bundle's own Info.plist name, the built-in
+//      Apple name table, or the store display name (only when it is
+//      really Chinese — Han, no kana/Hangul — and passes the sanity
+//      gate). Chinese is the user's first language, and a Chinese name
+//      from the store is the only store value that is trustworthy.
+//   2. The app's own English name — the API's localized name, the
+//      bundle Info.plist name, or the built-in table. These are the
+//      app's own declared names, not the store display field.
+//   3. The bundle-path folder name — the store record's bundlePath
+//      (e.g. .../Taobao.app) is known to resolve on 26.4.1; its last
+//      component is a clean English name and needs no file access.
+//   4. The store bundle name (CFBundleName), when sane.
+//   5. Nothing — the caller falls back to the bundle id.
+// A non-Chinese store display name is NEVER returned. On iOS 26.4.1 the
+// display-name field of the winning layout is misaligned and yields
+// wrong-language strings ("Kod sumber Fortran", "VNC interneto vieta"),
+// MIME types ("text/x-uuencode") and filenames ("csv_145x145@2x.png"),
+// and the CN5 plausibility check could not stop them: two-word phrases
+// passed by design, MIME types and filenames are single tokens, and the
+// multi-word cross-check compares against the bundle name, which is
+// itself garbage when the layout is wrong. So the store display name is
+// trusted for Chinese only, and everything else comes from the app's own
+// bundle or its path.
 NSString *wq_display_name(NSString *bundleID)
 {
     if (!bundleID) return nil;
@@ -1529,18 +1639,32 @@ NSString *wq_display_name(NSString *bundleID)
     // One snapshot for the whole call: the store cannot change under us
     // mid-lookup, and parent fallbacks do not re-trigger a load each time.
     WQLSSnapshot *snapshot = wq_ls_ensure_snapshot(nil, NO);
-    // The LaunchServices API's localized name first: it is the name
-    // SpringBoard shows, in the device language, and it does not depend on
-    // the LaunchServices record layout.
+    NSString *storeDisplay = snapshot.display[bid];
+    NSString *storeBundleName = snapshot.bundleName[bid];
+    NSString *builtin = wq_builtin_names()[bid];
+    // The LaunchServices API's localized name: it is the name SpringBoard
+    // shows, in the device language, and it does not depend on the
+    // LaunchServices record layout.
     NSString *fromAPI = wq_lsapi_name(bid);
-    if (fromAPI.length) return fromAPI;
-    // The bundle's own localized name next: it does not depend on the
+    // The bundle's own localized name: it does not depend on the
     // LaunchServices record layout either (the path comes from the API, the
     // Bundle directory, or the store record).
     NSString *fromBundle = wq_bundle_display_name(bid);
+    // 1. Chinese first, from any source.
+    if (wq_name_is_chinese(fromAPI)) return fromAPI;
+    if (wq_name_is_chinese(fromBundle)) return fromBundle;
+    if (wq_name_is_chinese(builtin)) return builtin;
+    if (wq_name_is_chinese(storeDisplay) &&
+        wq_ls_display_plausible(storeDisplay, storeBundleName, bid)) return storeDisplay;
+    // 2. The app's own English name (API, bundle Info.plist, built-in).
+    if (fromAPI.length) return fromAPI;
     if (fromBundle) return fromBundle;
-    NSString *name = wq_known_name(bid, snapshot);
-    if (name) return name;
+    if (builtin.length) return builtin;
+    // 3. The bundle-path folder name (the .app folder, e.g. Taobao).
+    NSString *pathName = wq_bundle_path_name(wq_bundle_path_for_id(bid));
+    if (pathName) return pathName;
+    // 4. The store bundle name, when sane.
+    if (wq_bundle_name_ok(storeBundleName)) return storeBundleName;
     // Unknown id: use the closest parent app (com.apple.news.widget -> News).
     // The parent gets the same full resolution (bundle first), so a widget
     // of a third-party app still shows its app's name.
@@ -1576,9 +1700,15 @@ NSArray<NSString *> *wq_ls_container_paths(NSString *storeHint)
 NSString *wq_bundle_path_for_id(NSString *bundleID)
 {
     if (!bundleID.length) return nil;
-    // The LaunchServices API's bundleURL first: on iOS 26.4 the CSStore2
-    // record layout does not yield a bundle path (offset +0x00 is not a
-    // path reference there), so the record below is usually empty.
+    // The LaunchServices API's bundleURL first, then the Bundle directory
+    // listing, then the CSStore2 record. On iOS 26.4.1 the record's
+    // bundlePath field (+0x00) DOES resolve (a third-party path such as
+    // .../Instagram.app is known from the record — the earlier claim that
+    // it comes out empty was wrong, see the file header), so the record is
+    // the only bundle-path source there (LSAPI: 0 apps; the Bundle
+    // directory is not listable). CN6 uses this path as a name source:
+    // its last component is the .app folder name (see
+    // wq_bundle_path_name), which needs no file access at all.
     NSString *apiPath = wq_lsapi_bundle_path(bundleID);
     if (apiPath.length) return apiPath;
     // The Bundle directory listing next.
