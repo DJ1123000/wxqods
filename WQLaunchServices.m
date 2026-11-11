@@ -883,6 +883,17 @@ static NSDictionary<NSString *, NSString *> *wq_builtin_names(void)
             @"com.apple.AMSEngagementViewService": @"Apple 媒体服务",
             @"com.apple.appManagedFeatures.Restrictions": @"访问限制", @"com.apple.CarRadio": @"车载收音机",
             @"com.apple.PassbookUIService": @"钱包面板", @"com.apple.Spotlight": @"聚焦搜索", @"com.apple.InputUI": @"键盘",
+            // Third-party apps: on iOS 26 the LaunchServices store often yields a
+            // wrong-language string as the display name, so these well-known ids
+            // are pinned to their real names and checked before the store.
+            @"com.tencent.xin": @"微信", @"com.tencent.mm": @"微信", @"com.tencent.mqq": @"QQ",
+            @"com.tencent.QQMusic": @"QQ音乐", @"com.ss.iphone.ugc.Aweme": @"抖音",
+            @"com.netease.cloudmusic": @"网易云音乐", @"com.taobao.fleamarket": @"闲鱼",
+            @"com.atebits.Tweetie2": @"X", @"com.google.chrome.ios": @"Chrome",
+            @"com.sina.weibo": @"微博", @"com.alibaba.iphone.taobao": @"淘宝",
+            @"com.zhihu.ios": @"知乎", @"com.baidu.ios": @"百度",
+            @"com.autonavi.amap": @"高德地图", @"com.meituan.iphone": @"美团",
+            @"com.tencent.map": @"腾讯地图", @"com.dianping.iphone": @"大众点评",
         };
     });
     return names;
@@ -890,7 +901,7 @@ static NSDictionary<NSString *, NSString *> *wq_builtin_names(void)
 
 static NSString *wq_known_name(NSString *bundleID, WQLSSnapshot *snapshot)
 {
-    return snapshot.display[bundleID] ?: wq_builtin_names()[bundleID] ?: snapshot.bundleName[bundleID];
+    return wq_builtin_names()[bundleID] ?: snapshot.display[bundleID] ?: snapshot.bundleName[bundleID];
 }
 
 BOOL wq_display_names_loaded(void)
