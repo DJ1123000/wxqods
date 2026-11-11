@@ -176,6 +176,88 @@ static void TestContainerMapping(NSString *path)
     WQCheck([wq_display_name(@"com.example.app") isEqualToString:@"AppName8"]);
 }
 
+static void TestDisplayNamePlausibility(NSString *path)
+{
+    // A UTI / App Store category is not an app name: fall back to the bundle name.
+    WriteData(StoreWithName(@"public.app-category.music-games"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    // A bare reverse-DNS identifier is not an app name either.
+    WriteData(StoreWithName(@"com.example.something"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    // Text that did not decode (replacement character) is not a name.
+    WriteData(StoreWithName(@"Bad\uFFFDEvil"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Example"]);
+    // A normal localized name still wins over the bundle name.
+    WriteData(StoreWithName(@"Retry \u65e5\u672c"), path);
+    WQCheck([wq_display_name(@"com.example.international") isEqualToString:@"Retry \u65e5\u672c"]);
+}
+
+static NSString *WriteTestBundle(NSString *displayName, NSString *localizedName)
+{
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"WQBundleTest-%d.app", getpid()]];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *plist = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        @"<plist version=\"1.0\"><dict>"
+        @"<key>CFBundleDisplayName</key><string>%@</string>"
+        @"<key>CFBundleName</key><string>PlistApp</string>"
+        @"</dict></plist>", displayName];
+    [plist writeToFile:[dir stringByAppendingPathComponent:@"Info.plist"]
+            atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (localizedName) {
+        NSString *firstLang = [NSLocale preferredLanguages].firstObject ?: @"en";
+        NSString *lproj = [dir stringByAppendingPathComponent:[firstLang stringByAppendingString:@".lproj"]];
+        [fm createDirectoryAtPath:lproj withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *strings = [NSString stringWithFormat:@"\"CFBundleDisplayName\" = \"%@\";\n", localizedName];
+        [strings writeToFile:[lproj stringByAppendingPathComponent:@"InfoPlist.strings"]
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return dir;
+}
+
+// One bundle record (27.0 layout) whose bundle path is bundlePath and whose
+// store display name is displayName (a UTI-like string, so the bundle must win).
+static NSData *StoreWithBundlePath(NSString *bundlePath, NSString *displayName)
+{
+    const NSUInteger recordOffset = 0x200;
+    const NSUInteger idOffset = 0x1000, containerOffset = 0x1100, nameOffset = 0x1040;
+    const NSUInteger displayOffset = 0x1080, pathOffset = 0x1180;
+    NSMutableData *data = [NSMutableData dataWithLength:0x3000];
+    uint8_t *bytes = data.mutableBytes;
+    memcpy(bytes, "bdsl", 4);
+    Put32(data, recordOffset + 4, 0x250);
+    Put32(data, recordOffset + 8 + 0x00, 6u << 2);   // bundle path
+    Put32(data, recordOffset + 8 + 0x0c, 1u << 2);   // bundle id
+    Put32(data, recordOffset + 8 + 0x68, 2u << 2);   // container path
+    Put32(data, recordOffset + 8 + 0x6c, 3u << 2);   // bundle name
+    Put32(data, recordOffset + 8 + 0x74, 4u << 2);   // display name
+    PutString(data, idOffset, 1, @"com.example.plistapp");
+    PutString(data, containerOffset, 2, kAppPath);
+    PutString(data, nameOffset, 3, @"PlistApp");
+    PutString(data, displayOffset, 4, displayName);
+    PutString(data, pathOffset, 6, bundlePath);
+    return data;
+}
+
+static void TestBundleDisplayName(NSString *path)
+{
+    // Base Info.plist name wins over a UTI-like store display name.
+    NSString *bundle = WriteTestBundle(@"Plist App", nil);
+    WriteData(StoreWithBundlePath(bundle, @"public.app-category.music-games"), path);
+    [NSUserDefaults.standardUserDefaults setObject:path forKey:@"WQLaunchServicesStore"];
+    WQCheck([wq_display_name(@"com.example.plistapp") isEqualToString:@"Plist App"]);
+    [[NSFileManager defaultManager] removeItemAtPath:bundle error:nil];
+
+    // Localized InfoPlist.strings wins over the base Info.plist name.
+    bundle = WriteTestBundle(@"Base App", @"Plist App Localized");
+    WriteData(StoreWithBundlePath(bundle, @"public.app-category.music-games"), path);
+    WQCheck([wq_display_name(@"com.example.plistapp") isEqualToString:@"Plist App Localized"]);
+    [[NSFileManager defaultManager] removeItemAtPath:bundle error:nil];
+}
+
 static void TestOversizedStoreFailsClosed(NSString *path)
 {
     int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -198,6 +280,8 @@ int main(void)
             TestRetryAfterDiscoveryFailure(path);
             TestRefreshAndUnicodeSafety(path);
             TestContainerMapping(path);
+            TestDisplayNamePlausibility(path);
+            TestBundleDisplayName(path);
             TestOversizedStoreFailsClosed(path);
         } @finally {
             [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
@@ -251,4 +335,11 @@ BOOL wq_system_areas_reachable(void)
 NSArray<NSString *> *wq_list(NSString *__unused dir, NSString *__unused *errorText)
 {
     return nil;
+}
+
+// The bundle-name resolver grants the bundle path when a direct read fails;
+// fixtures are in a readable temp dir, so the grant is never needed here.
+BOOL wq_grant(NSString *__unused path)
+{
+    return NO;
 }
