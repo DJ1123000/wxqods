@@ -15,6 +15,7 @@
 #import "WQAccess.h"
 #import "WQLaunchServices.h"
 #import "WQUI.h"
+#import "WQOperation.h"
 #import "WQSharing.h"
 #import "WQDir.h"
 #import "WQApps.h"
@@ -1252,11 +1253,17 @@ static WQArchiveIO *wq_app_archive_io(void)
         dispatch_async(dispatch_get_main_queue(), ^{ hud.message = text; });
     };
     WQArchiveCancelled cancelled = ^BOOL { return cancellation.isCancelled; };
+    // Keep the archive job alive if the user switches apps or locks the
+    // screen (about 30 s of background time). The work writes to a staging
+    // path that is noted below, so an interruption resumes instead of
+    // leaving a half-written archive behind.
+    wq_operation_keep_alive_begin(title);
     dispatch_async(wq_io(), ^{
         NSString *error = nil, *note = nil;
         BOOL ok = work(cancelled, progress, &error, &note);
         BOOL wasCancelled = cancellation.isCancelled;
         dispatch_async(dispatch_get_main_queue(), ^{
+            wq_operation_keep_alive_end();
             void (^finish)(void) = ^{
                 if (!ok && !wasCancelled) wq_alert(self, failureTitle, error ?: @"未知错误");
                 else if (ok && note) wq_alert(self, title, note);
@@ -1293,6 +1300,9 @@ static WQArchiveIO *wq_app_archive_io(void)
         (void)wq_grant(dir);   // the writer opens the staging file directly
         NSString *staging = [dir stringByAppendingPathComponent:
                              [@".wq-zip-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        // Note the staging path: if the app is terminated mid-job, the next
+        // launch removes this orphan instead of leaving a half-written ZIP.
+        wq_operation_note_zip_staging(staging);
         NSUInteger skipped = 0;
         BOOL ok = wq_zip_write(paths, staging, wq_app_archive_io(), cancelled, progress, &skipped, error);
         if (ok && cancelled()) ok = NO;
@@ -1304,6 +1314,7 @@ static WQArchiveIO *wq_app_archive_io(void)
             }
         }
         if (!ok) [NSFileManager.defaultManager removeItemAtPath:staging error:nil];
+        wq_operation_clear_zip_staging();
         wq_log(@"compress: %lu item(s) -> %@: %@", (unsigned long)paths.count, dest, ok ? @"OK" : *error);
         if (ok && skipped)
             *note = [NSString stringWithFormat:@"已创建 %@。已排除 %lu 个符号链接或特殊文件。",
@@ -1328,6 +1339,9 @@ static WQArchiveIO *wq_app_archive_io(void)
         (void)wq_grant(dir);   // the extractor opens files directly below dir
         NSString *staging = [dir stringByAppendingPathComponent:
                              [@".wq-unzip-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        // Note the staging path: if the app is terminated mid-job, the next
+        // launch removes this orphan instead of leaving a half-extracted folder.
+        wq_operation_note_zip_staging(staging);
         if (!wq_create_dir(staging, error)) {
             [NSFileManager.defaultManager removeItemAtPath:staging error:nil];
             return NO;
@@ -1352,6 +1366,7 @@ static WQArchiveIO *wq_app_archive_io(void)
             }
         }
         if (!ok) [NSFileManager.defaultManager removeItemAtPath:staging error:nil];
+        wq_operation_clear_zip_staging();
         wq_log(@"extract: %@ -> %@: %@ (%lu files, %lu skipped)", zipPath, dest, ok ? @"OK" : *error,
                (unsigned long)files, (unsigned long)skipped);
         if (ok && skipped)
@@ -2298,6 +2313,10 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
     [super viewDidLoad];
     self.delegate = self;
     self.interactivePopGestureRecognizer.delegate = self;
+    // Frosted glass chrome: the navigation bar and toolbar use the system
+    // material blur, so content scrolling underneath shows through as
+    // native iOS frosted glass.
+    wq_apply_frosted_chrome();
 }
 
 - (void)navigationController:(UINavigationController *)nav willShowViewController:(UIViewController *)vc animated:(BOOL)animated
@@ -2589,6 +2608,9 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
     window.rootViewController = [[WQNavigationController alloc] initWithRootViewController:[WQRootViewController new]];
     [window makeKeyAndVisible];
     self.window = window;
+    // A previous run terminated mid-archive leaves a hidden staging file
+    // or folder behind; remove it on launch so it does not linger.
+    wq_operation_remove_orphaned_zip_staging();
 }
 
 @end
@@ -2636,6 +2658,18 @@ static NSString *wq_count_text(int64_t n)
 {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
+    // Frosted glass: a system-material blur behind the content, so the
+    // sheet reads as native iOS frosted glass over whatever is beneath it.
+    UIVisualEffectView *frost = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    frost.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:frost];
+    [NSLayoutConstraint activateConstraints:@[
+        [frost.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [frost.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [frost.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [frost.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+    ]];
     _started = CFAbsoluteTimeGetCurrent();
     UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"]];
     icon.preferredSymbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:40 weight:UIImageSymbolWeightRegular];
@@ -2651,7 +2685,7 @@ static NSString *wq_count_text(int64_t n)
     text.textColor = UIColor.secondaryLabelColor;
     text.text = @"iOS 不允许 WQ Files 直接列出这些文件夹，因此它会逐一检查此设备上的每个文件。"
                 @"这仅在首次较慢：之后的扫描只检查新文件。\n\n"
-                @"请保持 WQ Files 打开。切换到其他应用或锁定屏幕会暂停扫描。";
+                @"可以切换到其他应用或锁定屏幕，扫描会继续进行；即使中断，下次也会从断点继续，不会从头开始。";
     _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
     _status = [UILabel new];
     _status.font = [UIFont monospacedDigitSystemFontOfSize:[UIFont preferredFontForTextStyle:UIFontTextStyleBody].pointSize
@@ -2713,7 +2747,6 @@ static NSString *wq_count_text(int64_t n)
 @end
 
 static WQScanWindowController *gScanWindow;
-static UIBackgroundTaskIdentifier gScanBackgroundTask;   // 0 is UIBackgroundTaskInvalid
 
 // Called on a scan thread: asks on the main thread and waits for the answer.
 static BOOL wq_confirm_full_scan(NSString *what, int64_t ids, double seconds)
@@ -2726,7 +2759,7 @@ static BOOL wq_confirm_full_scan(NSString *what, int64_t ids, double seconds)
         NSString *message = [NSString stringWithFormat:
             @"要列出 %@，WQ Files 需要逐一检查此设备上的每个文件：共 %@ 个文件，%@。\n\n"
             @"这仅在首次需要；之后的扫描只检查新文件，只需几秒。\n\n"
-            @"扫描期间请保持 WQ Files 打开。", what, wq_count_text(ids), wq_duration_text(seconds)];
+            @"扫描期间可以切换应用或锁定屏幕；即使中断，下次也会从断点继续。", what, wq_count_text(ids), wq_duration_text(seconds)];
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"扫描全部文件？" message:message
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"暂不" style:UIAlertActionStyleCancel handler:^(UIAlertAction *__unused a) {
@@ -2734,13 +2767,11 @@ static BOOL wq_confirm_full_scan(NSString *what, int64_t ids, double seconds)
         }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"开始扫描" style:UIAlertActionStyleDefault handler:^(UIAlertAction *__unused a) {
             start = YES;
-            // A little extra time when the user switches away (iOS grants about 30 s).
-            if (gScanBackgroundTask == UIBackgroundTaskInvalid) {
-                gScanBackgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"WQ full scan" expirationHandler:^{
-                    [UIApplication.sharedApplication endBackgroundTask:gScanBackgroundTask];
-                    gScanBackgroundTask = UIBackgroundTaskInvalid;
-                }];
-            }
+            // Keep the scan alive when the user switches away or locks the
+            // screen (about 30 s of background time). If it still gets
+            // interrupted, the scan checkpoints its progress and the next
+            // run resumes from there instead of starting over.
+            wq_operation_keep_alive_begin(@"WQ full scan");
             WQScanWindowController *window = [WQScanWindowController new];
             window.modalPresentationStyle = UIModalPresentationPageSheet;
             window.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.mediumDetent,
@@ -2767,10 +2798,7 @@ static void wq_full_scan_progress(int64_t done, int64_t total, BOOL finished)
         WQScanWindowController *window = gScanWindow;
         gScanWindow = nil;
         if (window.presentingViewController && !window.isBeingDismissed) [window dismissViewControllerAnimated:YES completion:nil];
-        if (gScanBackgroundTask != UIBackgroundTaskInvalid) {
-            [UIApplication.sharedApplication endBackgroundTask:gScanBackgroundTask];
-            gScanBackgroundTask = UIBackgroundTaskInvalid;
-        }
+        wq_operation_keep_alive_end();
     });
 }
 
