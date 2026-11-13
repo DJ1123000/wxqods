@@ -6,6 +6,7 @@
 
 #import "WQOperation.h"
 #import <Foundation/Foundation.h>
+#import <stdatomic.h>
 #if TARGET_OS_IOS
 #import <UIKit/UIKit.h>
 #endif
@@ -76,7 +77,9 @@ void wq_operation_remove_orphaned_zip_staging(void)
 #if TARGET_OS_IOS
 
 static UIBackgroundTaskIdentifier gKeepAliveTask = UIBackgroundTaskInvalid;
-static _Atomic BOOL gBackgroundExpiring = NO;
+// Zero-initialized (false); no explicit initializer: an _Atomic object with
+// static storage duration cannot take a non-constant initializer here.
+static _Atomic BOOL gBackgroundExpiring;
 
 void wq_operation_keep_alive_begin(NSString *name)
 {
