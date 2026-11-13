@@ -1302,8 +1302,11 @@ static void WQCacheSaveCleanCheckpoint(NSArray<WQCacheItem *> *selected, NSUInte
         [selected addObject:item];
     }
     NSUInteger nextIndex = [checkpoint[@"nextIndex"] unsignedIntegerValue];
-    unsigned long long freed = [checkpoint[@"freed"] unsignedLongLongValue];
-    BOOL allOk = [checkpoint[@"allOk"] boolValue];
+    // __block: the worker block below updates these across a resume, so it
+    // must capture them by reference (a plain capture is const inside the
+    // block and cannot be passed to runCleanLoop's out-parameters).
+    __block unsigned long long freed = [checkpoint[@"freed"] unsignedLongLongValue];
+    __block BOOL allOk = [checkpoint[@"allOk"] boolValue];
     if (!selected.count || nextIndex >= selected.count) {
         wq_operation_checkpoint_clear(@"cache-clean");
         [self scan];
