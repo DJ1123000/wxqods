@@ -32,20 +32,55 @@ NSString *wq_device_line(void)
                     : [NSString stringWithFormat:@"%@ · iOS %@", model, ver];
 }
 
+// Frosted glass chrome for the navigation bar and toolbar: a system-material
+// blur background, so content scrolling underneath shows through as native
+// iOS frosted glass. The bar stays opaque-looking (standardAppearance) while
+// its backgroundEffect is the blur, which is how the system bars do it.
+// Cheap: one shared appearance, no per-view blur views, no extra compositing
+// beyond what the system bars already do.
+void wq_apply_frosted_chrome(void)
+{
+    UINavigationBarAppearance *nav = [UINavigationBarAppearance new];
+    [nav configureWithDefaultBackground];
+    nav.backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    UINavigationBar.appearance.standardAppearance = nav;
+    UINavigationBar.appearance.scrollEdgeAppearance = nav;
+    UINavigationBar.appearance.compactAppearance = nav;
+    if (@available(iOS 15.0, *)) {
+        UINavigationBar.appearance.compactScrollEdgeAppearance = nav;
+    }
+    UIToolbarAppearance *toolbar = [UIToolbarAppearance new];
+    [toolbar configureWithDefaultBackground];
+    toolbar.backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    UIToolbar.appearance.standardAppearance = toolbar;
+    if (@available(iOS 15.0, *)) {
+        UIToolbar.appearance.scrollEdgeAppearance = toolbar;
+    }
+}
+
 // A small centered label with the device/iOS line, for a table header.
+// Frosted: the strip is a system-material blur view with rounded corners,
+// so it reads as a frosted glass chip floating over the table.
 UIView *wq_device_header(CGFloat width)
 {
     UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 50)];
+    UIVisualEffectView *frost = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    frost.frame = CGRectMake(0, 0, width, 34);
+    frost.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    frost.layer.cornerRadius = 8;
+    frost.clipsToBounds = YES;
     UILabel *header = [UILabel new];
     header.numberOfLines = 0;
     header.textAlignment = NSTextAlignmentCenter;
     header.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
     header.textColor = UIColor.secondaryLabelColor;
-    header.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    header.backgroundColor = UIColor.clearColor;
     header.text = wq_device_line();
-    header.frame = CGRectMake(0, 0, width, 34);
-    header.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [box addSubview:header];  // 16 pt of clear space below the strip
+    header.frame = frost.bounds;
+    header.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [frost.contentView addSubview:header];
+    [box addSubview:frost];  // 16 pt of clear space below the strip
     return box;
 }
 
