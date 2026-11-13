@@ -10,6 +10,7 @@
 #import "WQAccess.h"
 #import "WQLaunchServices.h"
 #import "WQCacheSafety.h"
+#import "WQOperation.h"
 
 #import <errno.h>
 #import <sys/stat.h>
@@ -412,34 +413,153 @@ static BOOL WQCacheValidateItem(WQCacheItem *item, NSString **reason)
 
 @end
 
-// Background task shared by the cache scan and clean (same pattern as the
-// full scan in main.m). iOS grants about 30 s when the user switches apps;
-// on expiration the work is cancelled cleanly so its partial results are
-// published instead of lost. One task id is shared: scan and clean never run
-// at the same time, and the expiration handler cancels whichever is current.
-static UIBackgroundTaskIdentifier gCacheBackgroundTask;   // 0 is UIBackgroundTaskInvalid
+// Long operations here (scan, clean) keep alive through the shared
+// WQOperation keep-alive instead of a local background task. On expiration
+// the operation is NOT cancelled: the worker checkpoints its progress and
+// the scan/clean resumes from that checkpoint instead of restarting.
+// See WQOperation.h.
 
-static void WQCacheBeginBackgroundTask(NSString *name, void (^onExpire)(void))
+// Checkpoint encode/decode for a cache item. The scan-time identities
+// (container device/inode/mode and each target record's identity) are
+// stored, not re-derived, so WQCacheValidateItem still detects a target
+// that changed between the scan and the clean.
+static NSDictionary *WQCacheTargetRecordEncode(WQCacheTargetRecord *record)
 {
-    if (gCacheBackgroundTask != UIBackgroundTaskInvalid) return;
-    gCacheBackgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:name expirationHandler:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (onExpire) onExpire();
-            if (gCacheBackgroundTask != UIBackgroundTaskInvalid) {
-                [UIApplication.sharedApplication endBackgroundTask:gCacheBackgroundTask];
-                gCacheBackgroundTask = UIBackgroundTaskInvalid;
-            }
-        });
-    }];
+    NSMutableDictionary *dict = [NSMutableDictionary new];
+    dict[@"path"] = record.path ?: @"";
+    if (record.relativePath.length) dict[@"relativePath"] = record.relativePath;
+    dict[@"existed"] = @(record.existed);
+    dict[@"identityKnown"] = @(record.identityKnown);
+    dict[@"device"] = @(record.device);
+    dict[@"inode"] = @(record.inode);
+    dict[@"mode"] = @(record.mode);
+    return dict;
 }
 
-static void WQCacheEndBackgroundTask(void)
+static WQCacheTargetRecord *WQCacheTargetRecordDecode(NSDictionary *dict)
 {
-    if (gCacheBackgroundTask == UIBackgroundTaskInvalid) return;
-    UIBackgroundTaskIdentifier task = gCacheBackgroundTask;
-    gCacheBackgroundTask = UIBackgroundTaskInvalid;
-    [UIApplication.sharedApplication endBackgroundTask:task];
+    if (![dict isKindOfClass:NSDictionary.class]) return nil;
+    NSString *path = [dict[@"path"] isKindOfClass:NSString.class] ? dict[@"path"] : nil;
+    if (!path.length) return nil;
+    WQCacheTargetRecord *record = [WQCacheTargetRecord new];
+    record.path = path;
+    if ([dict[@"relativePath"] isKindOfClass:NSString.class]) record.relativePath = dict[@"relativePath"];
+    record.existed = [dict[@"existed"] boolValue];
+    record.identityKnown = [dict[@"identityKnown"] boolValue];
+    record.device = [dict[@"device"] unsignedLongLongValue];
+    record.inode = [dict[@"inode"] unsignedLongLongValue];
+    record.mode = [dict[@"mode"] unsignedIntValue];
+    return record;
 }
+
+static NSDictionary *WQCacheItemEncode(WQCacheItem *item)
+{
+    NSMutableDictionary *dict = [NSMutableDictionary new];
+    dict[@"name"] = item.name ?: @"";
+    if (item.bundleID.length) dict[@"bundleID"] = item.bundleID;
+    dict[@"cacheBytes"] = @(item.cacheBytes);
+    dict[@"tempBytes"] = @(item.tempBytes);
+    dict[@"cacheKnown"] = @(item.cacheKnown);
+    dict[@"tempKnown"] = @(item.tempKnown);
+    dict[@"limited"] = @(item.limited);
+    dict[@"crashLogs"] = @(item.crashLogs);
+    if (item.containerPath.length) dict[@"containerPath"] = item.containerPath;
+    dict[@"containerIdentityKnown"] = @(item.containerIdentityKnown);
+    dict[@"containerDevice"] = @(item.containerDevice);
+    dict[@"containerInode"] = @(item.containerInode);
+    dict[@"containerMode"] = @(item.containerMode);
+    dict[@"selected"] = @(item.selected);
+    NSMutableArray *records = [NSMutableArray new];
+    for (WQCacheTargetRecord *record in item.targetRecords) {
+        [records addObject:WQCacheTargetRecordEncode(record)];
+    }
+    dict[@"targetRecords"] = records;
+    return dict;
+}
+
+static WQCacheItem *WQCacheItemDecode(NSDictionary *dict)
+{
+    if (![dict isKindOfClass:NSDictionary.class]) return nil;
+    NSString *name = [dict[@"name"] isKindOfClass:NSString.class] ? dict[@"name"] : nil;
+    if (!name.length) return nil;
+    WQCacheItem *item = [WQCacheItem new];
+    item.name = name;
+    if ([dict[@"bundleID"] isKindOfClass:NSString.class]) item.bundleID = dict[@"bundleID"];
+    item.cacheBytes = [dict[@"cacheBytes"] unsignedLongLongValue];
+    item.tempBytes = [dict[@"tempBytes"] unsignedLongLongValue];
+    item.cacheKnown = [dict[@"cacheKnown"] boolValue];
+    item.tempKnown = [dict[@"tempKnown"] boolValue];
+    item.limited = [dict[@"limited"] boolValue];
+    item.crashLogs = [dict[@"crashLogs"] boolValue];
+    if ([dict[@"containerPath"] isKindOfClass:NSString.class]) item.containerPath = dict[@"containerPath"];
+    item.containerIdentityKnown = [dict[@"containerIdentityKnown"] boolValue];
+    item.containerDevice = [dict[@"containerDevice"] unsignedLongLongValue];
+    item.containerInode = [dict[@"containerInode"] unsignedLongLongValue];
+    item.containerMode = [dict[@"containerMode"] unsignedIntValue];
+    item.selected = [dict[@"selected"] boolValue];
+    if (item.crashLogs) {
+        item.targets = @[kCrashLogsPath];
+    } else if (item.containerPath.length) {
+        NSString *caches = [item.containerPath stringByAppendingPathComponent:@"Library/Caches"];
+        NSString *tmp = [item.containerPath stringByAppendingPathComponent:@"tmp"];
+        item.targets = @[caches, tmp];
+    }
+    NSMutableArray *records = [NSMutableArray new];
+    for (NSDictionary *recordDict in [dict[@"targetRecords"] isKindOfClass:NSArray.class] ? dict[@"targetRecords"] : @[]) {
+        WQCacheTargetRecord *record = WQCacheTargetRecordDecode(recordDict);
+        if (record) [records addObject:record];
+    }
+    item.targetRecords = records;
+    return item;
+}
+
+// Whether a checkpoint-restored item's container is still the same
+// directory it was measured in. A changed or vanished container is
+// dropped from the restored list (and re-measured) instead of shown stale.
+static BOOL WQCacheItemContainerStillAlive(WQCacheItem *item)
+{
+    if (item.crashLogs) return YES;
+    if (!item.containerIdentityKnown || !item.containerPath.length) return NO;
+    struct stat st = {0};
+    if (!wq_stat(item.containerPath, &st) || !S_ISDIR(st.st_mode)) return NO;
+    return st.st_dev == item.containerDevice && st.st_ino == item.containerInode &&
+           (st.st_mode & S_IFMT) == item.containerMode;
+}
+
+// Saves a clean checkpoint: the selected items plus the index of the next
+// unprocessed item, so a paused clean resumes instead of restarting.
+static void WQCacheSaveCleanCheckpoint(NSArray<WQCacheItem *> *selected, NSUInteger nextIndex,
+                                       unsigned long long freed, BOOL allOk)
+{
+    NSMutableArray *encoded = [NSMutableArray new];
+    for (WQCacheItem *item in selected) [encoded addObject:WQCacheItemEncode(item)];
+    wq_operation_checkpoint_save(@"cache-clean", @{
+        @"version": @1,
+        @"items": encoded,
+        @"nextIndex": @(nextIndex),
+        @"freed": @(freed),
+        @"allOk": @(allOk),
+    });
+}
+
+@interface WQCacheCleanerViewController ()
+- (void)scan;
+- (void)clean;
+- (void)resumeClean;
+- (NSUInteger)runCleanLoop:(NSArray<WQCacheItem *> *)selected
+                startIndex:(NSUInteger)startIndex
+                     freed:(unsigned long long *)freedPtr
+                     allOk:(BOOL *)allOkPtr
+              cancellation:(WQScanCancellation *)cancellation
+                    paused:(BOOL *)pausedPtr
+         validationFailure:(NSString **)validationFailurePtr;
+- (void)finishClean:(NSArray<WQCacheItem *> *)selected
+              freed:(unsigned long long)freed
+              allOk:(BOOL)allOk
+             paused:(BOOL)paused
+           cancelled:(BOOL)cancelled
+  validationFailure:(NSString *)validationFailure;
+@end
 
 @implementation WQCacheCleanerViewController {
     NSArray<WQCacheItem *> *_items;
@@ -471,7 +591,10 @@ static void WQCacheEndBackgroundTask(void)
     self.definesPresentationContext = YES;
     self.refreshControl = [UIRefreshControl new];
     [self.refreshControl addTarget:self action:@selector(userRefresh) forControlEvents:UIControlEventValueChanged];
-    [self scan];
+    // A clean that paused (background time expired) resumes instead of
+    // starting a fresh scan; otherwise start a scan as before.
+    if (wq_operation_checkpoint_load(@"cache-clean")) [self resumeClean];
+    else [self scan];
 }
 
 - (void)viewWillAppear:(BOOL)animated
@@ -480,6 +603,12 @@ static void WQCacheEndBackgroundTask(void)
     // A user-driven (re)appearance starts a fresh auto-restart budget for
     // interrupted scans (see the publish block).
     _interruptedRestarts = 0;
+    // A clean that paused while this page was away resumes where it left
+    // off instead of restarting the scan from scratch.
+    if (!_scanning && !_cleaning && wq_operation_checkpoint_load(@"cache-clean")) {
+        [self resumeClean];
+        return;
+    }
     if (_scanning && _scanCancellation.isCancelled) {
         [self scan];
         return;
@@ -493,8 +622,11 @@ static void WQCacheEndBackgroundTask(void)
 - (void)viewWillDisappear:(BOOL)animated
 {
     [super viewWillDisappear:animated];
-    if (_scanning) [_scanCancellation cancel];
-    if (_cleaning) [_cleanCancellation cancel];
+    // Leaving the page no longer cancels a scan or a clean: the work is
+    // owned by the operation, not by this screen. It keeps running in the
+    // background (keep-alive) and, if the app is terminated while
+    // suspended, resumes from its checkpoint when the user returns. Only
+    // an explicit user stop cancels.
     [self.refreshControl endRefreshing];
 }
 
@@ -573,6 +705,8 @@ static void WQCacheEndBackgroundTask(void)
     wq_container_size_invalidate_all();
     wq_display_names_reset_miss();
     _interruptedRestarts = 0;
+    // A user refresh is a fresh start, not a resume: drop any checkpoint.
+    wq_operation_checkpoint_clear(@"cache-scan");
     [self scan];
 }
 
@@ -588,25 +722,85 @@ static void WQCacheEndBackgroundTask(void)
     _result = nil;
     [self updateButtons];
     [self setStatus:@"正在查找应用…"];
-    // Keep the scan alive if the user switches apps. iOS grants about 30 s;
-    // on expiration the scan is cancelled cleanly so the partial results are
-    // published instead of lost (see below). The handler cancels only this
-    // scan's token: it belongs to the task this scan registered, so a task
-    // that outlives a superseded scan must not kill the newer scan that
-    // adopted it (a stale handler cancelling the current token was the
-    // suspected cause of scans stopping after a few items).
-    WQCacheBeginBackgroundTask(@"WQ cache scan", ^{
-        [cancellation cancel];
-    });
+    // Keep the scan alive if the user switches apps or locks the screen
+    // (shared keep-alive, about 30 s of background time). On expiration
+    // the scan is NOT cancelled: the worker below checkpoints its
+    // progress, and a later run resumes from that checkpoint instead of
+    // starting over. Only an explicit new scan (or a user refresh)
+    // supersedes this one.
+    wq_operation_keep_alive_begin(@"WQ cache scan");
     dispatch_async(wq_io_scan(), ^{
         NSMutableArray<WQCacheItem *> *items = [NSMutableArray new];
         NSMutableArray<NSString *> *emptyRoots = [NSMutableArray new];
-        BOOL scanLimited = NO;
-        BOOL interrupted = NO;
-        NSUInteger failedEnumerations = 0;
-        NSUInteger limitedContainers = 0;
-        NSUInteger limitedMeasurements = 0;
-        NSUInteger missingIdentities = 0;
+        // __block: the checkpoint block below reads these as they change.
+        __block BOOL scanLimited = NO;
+        __block BOOL interrupted = NO;
+        __block NSUInteger failedEnumerations = 0;
+        __block NSUInteger limitedContainers = 0;
+        __block NSUInteger limitedMeasurements = 0;
+        __block NSUInteger missingIdentities = 0;
+        __block BOOL crashMeasured = NO;
+        __block unsigned long long crashBytes = 0;
+        __block BOOL crashKnown = NO;
+        // Resume from a checkpoint when one exists (the app was terminated
+        // while suspended, or an earlier scan was interrupted): restored
+        // items are kept, already-measured containers are skipped, and only
+        // the rest is measured. A container whose identity changed since
+        // the checkpoint is dropped and re-measured.
+        NSMutableSet<NSString *> *measured = [NSMutableSet new];
+        NSDictionary *checkpoint = wq_operation_checkpoint_load(@"cache-scan");
+        if (checkpoint) {
+            for (NSDictionary *itemDict in [checkpoint[@"items"] isKindOfClass:NSArray.class] ? checkpoint[@"items"] : @[]) {
+                WQCacheItem *restored = WQCacheItemDecode(itemDict);
+                if (!restored) continue;
+                if (!WQCacheItemContainerStillAlive(restored)) {
+                    wq_log(@"cache scan: dropping checkpoint item %@ (container changed)", restored.name);
+                    continue;
+                }
+                [items addObject:restored];
+                if (restored.containerPath.length) [measured addObject:restored.containerPath];
+            }
+            for (NSString *path in [checkpoint[@"measured"] isKindOfClass:NSArray.class] ? checkpoint[@"measured"] : @[]) {
+                if ([path isKindOfClass:NSString.class]) [measured addObject:path];
+            }
+            scanLimited = [checkpoint[@"scanLimited"] boolValue];
+            failedEnumerations = [checkpoint[@"failedEnumerations"] unsignedIntegerValue];
+            limitedContainers = [checkpoint[@"limitedContainers"] unsignedIntegerValue];
+            limitedMeasurements = [checkpoint[@"limitedMeasurements"] unsignedIntegerValue];
+            missingIdentities = [checkpoint[@"missingIdentities"] unsignedIntegerValue];
+            crashMeasured = [checkpoint[@"crashMeasured"] boolValue];
+            crashBytes = [checkpoint[@"crashBytes"] unsignedLongLongValue];
+            crashKnown = [checkpoint[@"crashKnown"] boolValue];
+            if (items.count || measured.count) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (generation != self->_scanGeneration || cancellation.isCancelled) return;
+                    [self setStatus:@"继续查找应用…"];
+                });
+                wq_log(@"cache scan: resuming from checkpoint (%lu items, %lu containers measured)",
+                       (unsigned long)items.count, (unsigned long)measured.count);
+            }
+        }
+        // Saves the checkpoint from this worker thread (it owns the state,
+        // so there is no race with the main thread). Called every 20
+        // containers and when the background time expires.
+        NSUInteger sinceCheckpoint = 0;
+        void (^saveCheckpoint)(void) = ^{
+            NSMutableArray *encoded = [NSMutableArray new];
+            for (WQCacheItem *item in items) [encoded addObject:WQCacheItemEncode(item)];
+            wq_operation_checkpoint_save(@"cache-scan", @{
+                @"version": @1,
+                @"items": encoded,
+                @"measured": [measured allObjects],
+                @"scanLimited": @(scanLimited),
+                @"failedEnumerations": @(failedEnumerations),
+                @"limitedContainers": @(limitedContainers),
+                @"limitedMeasurements": @(limitedMeasurements),
+                @"missingIdentities": @(missingIdentities),
+                @"crashMeasured": @(crashMeasured),
+                @"crashBytes": @(crashBytes),
+                @"crashKnown": @(crashKnown),
+            });
+        };
         NSArray *roots = @[@"/private/var/mobile/Containers/Data/Application",
                            @"/private/var/mobile/Containers/Data/PluginKitPlugin"];
         for (NSString *root in roots) {
@@ -654,6 +848,8 @@ static void WQCacheEndBackgroundTask(void)
                                          (unsigned long)idx, (unsigned long)containers.count]];
                     });
                 }
+                // Resuming from a checkpoint: skip containers already measured.
+                if ([measured containsObject:c]) continue;
                 BOOL safeContainer = WQCacheSafetyHasNoSymlinkAncestry(c, NO);
                 BOOL granted = safeContainer && wq_grant(c);  // one token for the whole container
                 NSString *caches = [c stringByAppendingPathComponent:@"Library/Caches"];
@@ -668,6 +864,19 @@ static void WQCacheEndBackgroundTask(void)
                 if (!WQCacheMeasureContainer(c, granted, safeContainer, safeCaches, safeTmp,
                                              cancellation, &cacheBytes, &tempBytes,
                                              &cacheState, &tempState)) { interrupted = YES; break; }
+                // Measured: remember it so a later run skips it, and
+                // checkpoint every 20 containers (or when the background
+                // time expired) so an interruption resumes instead of
+                // restarting from scratch. A cancelled (superseded) scan
+                // must not overwrite the checkpoint a fresh scan cleared.
+                [measured addObject:c];
+                sinceCheckpoint++;
+                if (!cancellation.isCancelled &&
+                    (sinceCheckpoint >= 20 || wq_operation_background_expiring())) {
+                    sinceCheckpoint = 0;
+                    saveCheckpoint();
+                    wq_operation_clear_background_expiring();
+                }
                 if (!granted || !safeContainer) {
                     scanLimited = YES;
                     limitedContainers++;
@@ -709,6 +918,21 @@ static void WQCacheEndBackgroundTask(void)
             if (interrupted) break;
         }
         if (!interrupted) {
+        if (crashMeasured) {
+            // Resuming: the crash-logs section was already measured; reuse it.
+            if (crashBytes > 0 || !crashKnown) {
+                WQCacheItem *logs = [WQCacheItem new];
+                logs.name = @"崩溃日志";
+                logs.targets = @[kCrashLogsPath];
+                logs.cacheBytes = crashBytes;
+                logs.cacheKnown = crashKnown;
+                logs.crashLogs = YES;
+                logs.limited = !crashKnown;
+                logs.targetRecords = @[WQCacheTargetRecordForPath(kCrashLogsPath, nil)];
+                logs.selected = !logs.limited;
+                [items addObject:logs];
+            }
+        } else {
         unsigned long long crash = 0;
         // Crash logs are in a system group, which worse_query reaches on iOS 27
         // only. On iOS 26 the section is left out instead of reported as limited.
@@ -724,6 +948,10 @@ static void WQCacheEndBackgroundTask(void)
             scanLimited = YES;
             limitedMeasurements++;
         }
+        crashMeasured = YES;
+        crashBytes = crash;
+        crashKnown = crashState != WQCacheMeasurementLimited;
+        saveCheckpoint();
         if (crashState == WQCacheMeasurementLimited || crash > 0) {
             WQCacheItem *logs = [WQCacheItem new];
             logs.name = @"崩溃日志";
@@ -735,6 +963,7 @@ static void WQCacheEndBackgroundTask(void)
             logs.targetRecords = @[WQCacheTargetRecordForPath(kCrashLogsPath, nil)];
             logs.selected = !logs.limited;
             [items addObject:logs];
+        }
         }
         }
         }
@@ -791,7 +1020,10 @@ static void WQCacheEndBackgroundTask(void)
             [self.refreshControl endRefreshing];
             [self.tableView reloadData];
             [self updateButtons];
-            WQCacheEndBackgroundTask();
+            wq_operation_keep_alive_end();
+            // A complete scan makes the checkpoint stale; drop it. An
+            // interrupted scan keeps it so the next run resumes.
+            if (!interrupted) wq_operation_checkpoint_clear(@"cache-scan");
             unsigned long long foundBytes = 0;
             for (WQCacheItem *it in items) foundBytes += it.bytes;
             wq_log(@"cache scan: found %lu items (%@), interrupted=%d, failed enumerations=%lu, kept previous=%d",
@@ -799,12 +1031,14 @@ static void WQCacheEndBackgroundTask(void)
                    (unsigned long)failedEnumerations, (int)keepPrevious);
             // An interrupted scan leaves a partial list. If the user is still
             // looking at this screen (foreground, view visible) and no clean
-            // is running, restart the scan so the list completes instead of
+            // is running, resume the scan so the list completes instead of
             // sticking at a partial count (e.g. 6 items after the background
-            // task expired mid-scan). Bounded: a scan that keeps being
-            // interrupted stops retrying after a few attempts; the user can
-            // still pull to refresh. The budget resets on a complete scan
-            // and on a user-initiated rescan (see viewWillAppear/userRefresh).
+            // task expired mid-scan). The resumed run loads the checkpoint
+            // and only measures what is left, so it does not start over.
+            // Bounded: a scan that keeps being interrupted stops retrying
+            // after a few attempts; the user can still pull to refresh. The
+            // budget resets on a complete scan and on a user-initiated
+            // rescan (see viewWillAppear/userRefresh).
             if (interrupted && !_cleaning && self.view.window &&
                 [UIApplication.sharedApplication applicationState] == UIApplicationStateActive) {
                 if (self->_interruptedRestarts < 3) {
@@ -987,18 +1221,19 @@ static void WQCacheEndBackgroundTask(void)
 - (void)clean
 {
     NSArray<WQCacheItem *> *selected = [_items filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"selected == YES"]];
+    // A fresh clean supersedes any paused one.
+    wq_operation_checkpoint_clear(@"cache-clean");
     WQScanCancellation *cancellation = [WQScanCancellation new];
     _cleanCancellation = cancellation;
     _cleaning = YES;
     [self updateButtons];
     [self setStatus:@"正在清理…"];
-    // Keep the clean alive if the user switches apps; on expiration it stops
-    // after the current item and reports what was freed (see below). The
-    // handler cancels only this clean's token, for the same reason as the
-    // scan's handler above: a stale task must not kill newer work.
-    WQCacheBeginBackgroundTask(@"WQ cache clean", ^{
-        [cancellation cancel];
-    });
+    // Keep the clean alive if the user switches apps or locks the screen
+    // (shared keep-alive, about 30 s of background time). On expiration the
+    // clean pauses after the current item and checkpoints its progress, so
+    // the next run resumes instead of restarting. Only an explicit user
+    // stop cancels.
+    wq_operation_keep_alive_begin(@"WQ cache clean");
     dispatch_async(wq_io(), ^{
         unsigned long long freed = 0;
         BOOL allOk = YES;
@@ -1023,35 +1258,17 @@ static void WQCacheEndBackgroundTask(void)
                 self->_result = [NSString stringWithFormat:@"清理已取消：%@。请重新扫描后再试。", validationFailure];
                 [self.tableView reloadData];
                 [self updateButtons];
-                WQCacheEndBackgroundTask();
+                wq_operation_keep_alive_end();
             });
             return;
         }
-        NSUInteger i = 0;
-        for (WQCacheItem *item in selected) {
-            if (cancellation.isCancelled) { cancelled = YES; break; }
-            i++;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self setStatus:[NSString stringWithFormat:@"正在清理 %lu/%lu：%@",
-                                 (unsigned long)i, (unsigned long)selected.count, item.name]];
-            });
-            for (WQCacheTargetRecord *record in item.targetRecords) {
-                if (cancellation.isCancelled) { cancelled = YES; break; }
-                NSString *reason = nil;
-                if (!WQCacheValidateItem(item, &reason)) {
-                    allOk = NO;
-                    validationFailure = [NSString stringWithFormat:@"%@ (%@)", item.name, reason ?: @"身份已更改"];
-                    wq_log(@"clean: stopped before %@ because %@", record.path, reason ?: @"identity validation failed");
-                    break;
-                }
-                if (!wq_purge_contents_cancellable(record.path, &freed, cancellation)) {
-                    allOk = NO;
-                    if (cancellation.isCancelled) { cancelled = YES; break; }
-                }
-            }
-            if (validationFailure || cancelled) break;
-        }
-        wq_log(@"clean: freed %llu bytes, allOk=%d cancelled=%d", freed, allOk, cancelled);
+        BOOL paused = NO;
+        NSUInteger nextIndex = [self runCleanLoop:selected startIndex:0 freed:&freed allOk:&allOk
+                                       cancellation:cancellation paused:&paused
+                                    validationFailure:&validationFailure];
+        cancelled = cancellation.isCancelled;
+        wq_log(@"clean: freed %llu bytes, allOk=%d cancelled=%d paused=%d nextIndex=%lu",
+               freed, allOk, cancelled, paused, (unsigned long)nextIndex);
         // Cleaning changes containers below their roots, which the size
         // cache's root-mtime check cannot see: drop the cleaned entries so
         // the rescan in scan measures the emptied caches.
@@ -1059,31 +1276,173 @@ static void WQCacheEndBackgroundTask(void)
             if (item.containerPath.length) wq_container_size_invalidate(item.containerPath);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            self->_cleaning = NO;
-            self->_cleanCancellation = nil;
-            if (cancelled) {
-                self->_status = nil;
-                [self scan];
-                self->_result = [NSString stringWithFormat:@"已停止。已释放 %@。%@", wq_size_text(freed),
-                                 allOk ? @"" : @" 有些项目无法删除（见日志）。"];
-                return;
-            }
-            if (validationFailure) {
-                self->_scanLimited = YES;
-                self->_cleanRequiresRescan = YES;
-                self->_status = nil;
-                self->_result = [NSString stringWithFormat:@"清理已停止：%@。请重新扫描后再试。", validationFailure];
-                [self.tableView reloadData];
-                [self updateButtons];
-            } else {
-                self->_status = nil;
-                [self scan];
-                self->_result = [NSString stringWithFormat:@"已释放 %@。%@", wq_size_text(freed),
-                                 allOk ? @"" : @" 有些项目无法删除（见日志）。"];
-            }
-            WQCacheEndBackgroundTask();
+            [self finishClean:selected freed:freed allOk:allOk paused:paused
+                    cancelled:cancelled validationFailure:validationFailure];
         });
     });
+}
+
+// Resumes a clean that paused (background time expired, or the app was
+// terminated while suspended). Already-cleaned items are skipped; the
+// remaining items are cleaned in the same order.
+- (void)resumeClean
+{
+    NSDictionary *checkpoint = wq_operation_checkpoint_load(@"cache-clean");
+    if (!checkpoint) return;
+    NSMutableArray<WQCacheItem *> *selected = [NSMutableArray new];
+    for (NSDictionary *itemDict in [checkpoint[@"items"] isKindOfClass:NSArray.class] ? checkpoint[@"items"] : @[]) {
+        WQCacheItem *item = WQCacheItemDecode(itemDict);
+        if (!item) continue;
+        // A container that changed since the checkpoint is dropped; the
+        // rescan after the clean re-measures it.
+        if (!item.crashLogs && !WQCacheItemContainerStillAlive(item)) {
+            wq_log(@"clean resume: dropping checkpoint item %@ (container changed)", item.name);
+            continue;
+        }
+        [selected addObject:item];
+    }
+    NSUInteger nextIndex = [checkpoint[@"nextIndex"] unsignedIntegerValue];
+    unsigned long long freed = [checkpoint[@"freed"] unsignedLongLongValue];
+    BOOL allOk = [checkpoint[@"allOk"] boolValue];
+    if (!selected.count || nextIndex >= selected.count) {
+        wq_operation_checkpoint_clear(@"cache-clean");
+        [self scan];
+        return;
+    }
+    wq_log(@"clean resume: resuming at item %lu/%lu, already freed %@",
+           (unsigned long)(nextIndex + 1), (unsigned long)selected.count, wq_size_text(freed));
+    WQScanCancellation *cancellation = [WQScanCancellation new];
+    _cleanCancellation = cancellation;
+    _cleaning = YES;
+    [self updateButtons];
+    [self setStatus:@"继续清理…"];
+    wq_operation_keep_alive_begin(@"WQ cache clean (resume)");
+    dispatch_async(wq_io(), ^{
+        BOOL paused = NO;
+        NSString *validationFailure = nil;
+        NSUInteger next = [self runCleanLoop:selected startIndex:nextIndex freed:&freed allOk:&allOk
+                                  cancellation:cancellation paused:&paused
+                               validationFailure:&validationFailure];
+        BOOL cancelled = cancellation.isCancelled;
+        wq_log(@"clean resume: freed %llu bytes total, allOk=%d cancelled=%d paused=%d nextIndex=%lu",
+               freed, allOk, cancelled, paused, (unsigned long)next);
+        for (WQCacheItem *item in selected) {
+            if (item.containerPath.length) wq_container_size_invalidate(item.containerPath);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self finishClean:selected freed:freed allOk:allOk paused:paused
+                    cancelled:cancelled validationFailure:validationFailure];
+        });
+    });
+}
+
+// Runs the clean loop on the calling (worker) thread, starting at
+// startIndex. Returns the index of the next unprocessed item; *paused is
+// set when the background time expired (a checkpoint was saved, so the
+// next run resumes at the returned index). *freed/*allOk accumulate across
+// a resume. Must be called on a worker queue, never the main thread.
+- (NSUInteger)runCleanLoop:(NSArray<WQCacheItem *> *)selected
+                startIndex:(NSUInteger)startIndex
+                     freed:(unsigned long long *)freedPtr
+                     allOk:(BOOL *)allOkPtr
+              cancellation:(WQScanCancellation *)cancellation
+                    paused:(BOOL *)pausedPtr
+         validationFailure:(NSString **)validationFailurePtr
+{
+    *pausedPtr = NO;
+    NSUInteger i = startIndex;
+    NSUInteger sinceCheckpoint = 0;
+    for (; i < selected.count; i++) {
+        WQCacheItem *item = selected[i];
+        if (cancellation.isCancelled) break;
+        // Background time expired: pause instead of cancelling. The
+        // checkpoint below holds the progress, so the next run resumes at
+        // this item instead of starting over.
+        if (wq_operation_background_expiring()) {
+            *pausedPtr = YES;
+            wq_operation_clear_background_expiring();
+            break;
+        }
+        NSUInteger shown = i + 1;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setStatus:[NSString stringWithFormat:@"正在清理 %lu/%lu：%@",
+                             (unsigned long)shown, (unsigned long)selected.count, item.name]];
+        });
+        for (WQCacheTargetRecord *record in item.targetRecords) {
+            if (cancellation.isCancelled) break;
+            NSString *reason = nil;
+            if (!WQCacheValidateItem(item, &reason)) {
+                *allOkPtr = NO;
+                if (validationFailurePtr) *validationFailurePtr = [NSString stringWithFormat:@"%@ (%@)", item.name, reason ?: @"身份已更改"];
+                wq_log(@"clean: stopped before %@ because %@", record.path, reason ?: @"identity validation failed");
+                break;
+            }
+            if (!wq_purge_contents_cancellable(record.path, freedPtr, cancellation)) {
+                *allOkPtr = NO;
+                if (cancellation.isCancelled) break;
+            }
+        }
+        if (*validationFailurePtr || cancellation.isCancelled || *pausedPtr) break;
+        // This item is done. Checkpoint every 10 items so a termination
+        // while suspended loses at most 10 items of progress.
+        sinceCheckpoint++;
+        if (sinceCheckpoint >= 10) {
+            sinceCheckpoint = 0;
+            WQCacheSaveCleanCheckpoint(selected, i + 1, *freedPtr, *allOkPtr);
+        }
+    }
+    // Paused: save the checkpoint at the item we stopped before.
+    if (*pausedPtr) WQCacheSaveCleanCheckpoint(selected, i, *freedPtr, *allOkPtr);
+    return i;
+}
+
+// Shared completion for clean and resumeClean. Must be called on the main
+// queue. Ends the keep-alive; clears the checkpoint except when paused
+// (a pause keeps it so the next run resumes).
+- (void)finishClean:(NSArray<WQCacheItem *> *)selected
+              freed:(unsigned long long)freed
+              allOk:(BOOL)allOk
+             paused:(BOOL)paused
+           cancelled:(BOOL)cancelled
+  validationFailure:(NSString *)validationFailure
+{
+    self->_cleaning = NO;
+    self->_cleanCancellation = nil;
+    if (paused) {
+        // Paused, not cancelled: the checkpoint holds the progress.
+        // Resumes automatically when the user returns to this page
+        // (viewWillAppear/viewDidLoad), or when they tap clean again.
+        self->_status = [NSString stringWithFormat:@"已暂停，已释放 %@，返回后继续清理…", wq_size_text(freed)];
+        self->_result = [NSString stringWithFormat:@"已暂停：已释放 %@。切回本页后自动继续。", wq_size_text(freed)];
+        [self.tableView reloadData];
+        [self updateButtons];
+        wq_operation_keep_alive_end();
+        return;
+    }
+    // Done, cancelled, or validation-failed: no resume.
+    wq_operation_checkpoint_clear(@"cache-clean");
+    if (cancelled) {
+        self->_status = nil;
+        [self scan];
+        self->_result = [NSString stringWithFormat:@"已停止。已释放 %@。%@", wq_size_text(freed),
+                         allOk ? @"" : @" 有些项目无法删除（见日志）。"];
+        wq_operation_keep_alive_end();
+        return;
+    }
+    if (validationFailure) {
+        self->_scanLimited = YES;
+        self->_cleanRequiresRescan = YES;
+        self->_status = nil;
+        self->_result = [NSString stringWithFormat:@"清理已停止：%@。请重新扫描后再试。", validationFailure];
+        [self.tableView reloadData];
+        [self updateButtons];
+    } else {
+        self->_status = nil;
+        [self scan];
+        self->_result = [NSString stringWithFormat:@"已释放 %@。%@", wq_size_text(freed),
+                         allOk ? @"" : @" 有些项目无法删除（见日志）。"];
+    }
+    wq_operation_keep_alive_end();
 }
 
 @end
