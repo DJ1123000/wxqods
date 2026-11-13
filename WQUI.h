@@ -22,6 +22,9 @@ dispatch_queue_t wq_io_interactive(void);
 // background work that must not compete with interactive reads or writes.
 dispatch_queue_t wq_io_scan(void);
 void wq_alert(UIViewController *host, NSString *title, NSString *_Nullable message);
+// Applies the frosted-glass chrome to the navigation bar and toolbar
+// (system-material blur). Call once at launch.
+void wq_apply_frosted_chrome(void);
 NSString *wq_size_text(unsigned long long size);
 UIView *wq_device_header(CGFloat width);
 // "iPhone 17 Pro Max (iPhone18,2) · iOS 27.0.1 (24A446)"
