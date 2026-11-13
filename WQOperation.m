@@ -76,7 +76,9 @@ void wq_operation_remove_orphaned_zip_staging(void)
 
 #if TARGET_OS_IOS
 
-static UIBackgroundTaskIdentifier gKeepAliveTask = UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier gKeepAliveTask; // zero-initialized: 0 == UIBackgroundTaskInvalid
+// (UIBackgroundTaskInvalid is an extern const, not a compile-time constant,
+// so a file-scope variable cannot be initialized with it.)
 // Zero-initialized (false); no explicit initializer: an _Atomic object with
 // static storage duration cannot take a non-constant initializer here.
 static _Atomic BOOL gBackgroundExpiring;
