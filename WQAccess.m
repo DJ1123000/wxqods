@@ -15,6 +15,7 @@
 #import "WQAccess.h"
 #import "WQCore.h"
 #import "WQAccessSafety.h"
+#import "WQOperation.h"
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <dirent.h>
@@ -1365,11 +1366,16 @@ static int64_t wq_volume_max_inode(fsid_t fsid, int64_t *probeInode)
 // progress gets the ids done, the range size and the hits per base. Returns
 // one dictionary per base, or nil when cancelled.
 typedef void (^WQScanProgress)(int64_t done, int64_t total, const NSUInteger *counts);
+// Called periodically (throttled inside wq_scan_children) with the containers
+// found so far and how many ids have been scanned, so a long scan can
+// checkpoint its progress instead of losing it when interrupted. May be nil.
+typedef void (^WQScanCheckpoint)(NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *foundSoFar, int64_t doneSoFar);
 static NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *wq_scan_children(fsid_t fsid, int64_t firstId, int64_t lastId,
                                                                                NSArray<NSString *> *bases,
                                                                                WQScanCancellation *cancellation,
                                                                                qos_class_t qos, BOOL allCores,
-                                                                               WQScanProgress progress)
+                                                                               WQScanProgress progress,
+                                                                               WQScanCheckpoint checkpoint)
 {
     NSUInteger baseCount = MIN(bases.count, (NSUInteger)8);
     // Heap tables: blocks can't capture C arrays.
@@ -1389,6 +1395,7 @@ static NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *wq_scan_children(
     const int64_t chunk = 32768;
     int64_t chunks = (total + chunk - 1) / chunk;
     __block int64_t nextChunk = 0, done = 0;
+    __block CFAbsoluteTime lastCheckpoint = 0; // throttles the checkpoint block
     NSUInteger cores = NSProcessInfo.processInfo.activeProcessorCount;
     // A full scan the user agreed to wait for uses all but two cores; the
     // short incremental scans stay at half the cores.
@@ -1427,8 +1434,25 @@ static NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *wq_scan_children(
             }
             done += last - first + 1;
             int64_t nowDone = done;
+            BOOL shouldCheckpoint = NO;
+            NSArray *checkpointFound = nil;
+            if (checkpoint) {
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                if (now - lastCheckpoint >= 15.0) {
+                    lastCheckpoint = now;
+                    shouldCheckpoint = YES;
+                    // Snapshot while holding the lock so no worker mutates
+                    // `found` while it is copied.
+                    NSMutableArray *copy = [NSMutableArray new];
+                    for (NSUInteger i = 0; i < baseCount; i++) [copy addObject:[found[i] copy]];
+                    checkpointFound = copy;
+                }
+            }
             [lock unlock];
             if (progress && !cancellation.isCancelled) progress(nowDone, total, snapshot);
+            // Invoked after the lock is released: the checkpoint block may
+            // write to disk, which must not stall the other workers.
+            if (shouldCheckpoint) checkpoint(checkpointFound, nowDone);
         }
     });
     for (NSUInteger i = 0; i < baseCount; i++) free(prefixes[i]);
@@ -2251,7 +2275,27 @@ inodeScan:;
         if (progress) progress(done, total, (index < roots.count ? known[index].count : 0) + (index < 8 ? counts[index] : 0));
         if (stop && gFullScanProgress) gFullScanProgress(done, total, NO);
     };
-    NSArray *lists = wq_scan_children(fsid, firstId, maxInode, roots, stop, qos, stop != nil, report);
+    NSArray *lists = wq_scan_children(fsid, firstId, maxInode, roots, stop, qos, stop != nil, report,
+        ^(NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *foundSoFar, int64_t doneSoFar) {
+            // Checkpoint the partial scan: the containers already known
+            // plus the ones found so far, with the probe advanced to the
+            // last scanned id. A later run only checks the ids above it,
+            // so an interrupted full scan resumes instead of restarting.
+            NSMutableDictionary *saved = [NSMutableDictionary new];
+            for (NSUInteger i = 0; i < roots.count; i++) {
+                NSMutableDictionary *merged = [known[i] mutableCopy];
+                if (i < foundSoFar.count) [merged addEntriesFromDictionary:foundSoFar[i]];
+                saved[roots[i]] = merged;
+            }
+            int64_t checkpointProbe = firstId + doneSoFar - 1;
+            if (checkpointProbe < 0) checkpointProbe = 0;
+            wq_scan_cache_save(fsid, checkpointProbe, fullAt, saved);
+            wq_log(@"scan: checkpointed %lld ids (%lu apps, %lu extensions, %lu daemons)",
+                   (long long)doneSoFar,
+                   (unsigned long)[saved[roots[0]] count],
+                   (unsigned long)[saved[roots[1]] count],
+                   (unsigned long)[saved[roots[2]] count]);
+        });
     if (stop) wq_full_scan_end(stop);
     if (!lists) return nil;
     NSMutableDictionary *saved = [NSMutableDictionary new];
@@ -2459,7 +2503,7 @@ NSArray<NSString *> *wq_enumerate(NSString *dir, int64_t maxInode, WQScanCancell
         ^(int64_t done, int64_t total, const NSUInteger *counts) {
             if (progress) progress(done, total, counts[0]);
             if (stop && gFullScanProgress) gFullScanProgress(done, total, NO);
-        });
+        }, nil);
     if (stop) { wq_full_scan_end(stop); [either cancel]; }
     if (!lists) return nil;
     if (dynamicBound) wq_check_scan_completion(fsid, probeInode, dir);
