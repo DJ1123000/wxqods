@@ -488,7 +488,10 @@ static BOOL wq_dir_size_cancellable(NSString *dir, WQScanCancellation *cancellat
 - (void)viewWillDisappear:(BOOL)animated
 {
     [super viewWillDisappear:animated];
-    if (_scanning) [_scanCancellation cancel];
+    // Leaving the page no longer cancels the apps scan: the scan is owned
+    // by the operation (shared keep-alive + scan-cache checkpoint), not by
+    // this screen, so switching apps or locking the screen does not restart
+    // it from scratch. Only an explicit new scan supersedes it.
 }
 
 - (void)setBusy:(BOOL)busy status:(NSString *)status
